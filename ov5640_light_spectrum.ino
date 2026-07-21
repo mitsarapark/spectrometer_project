@@ -22,11 +22,13 @@ const int fram_h = 240;
 const int scan_row = fram_h / 2;   
 const int STEP = 2;               
 
+// not true depend on light bull that we need to calibrate
 const int CAL_PX1 = 60,  CAL_WL1 = 450;  
 const int CAL_PX2 = 260, CAL_WL2 = 650;  
 
+float slope = (float)(CAL_WL2 - CAL_WL1) / (float)(CAL_PX2 - CAL_PX1);
+
 float pixelToWavelength(int px) {
-  float slope = (float)(CAL_WL2 - CAL_WL1) / (float)(CAL_PX2 - CAL_PX1);
   return CAL_WL1 + slope * (px - CAL_PX1);
 }
 
