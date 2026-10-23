@@ -9,7 +9,7 @@
  *    - RGB565(r,g,b) macro
  *    - GRAPH_LEFT/RIGHT/TOP/BOTTOM/WIDTH/HEIGHT, COLORBAR_Y/HEIGHT,
  *      TEXT_Y, DISP_WIDTH, DISP_HEIGHT
- *    - SPECTRUM_LEN, ROW_AVG_RANGE, TEMPORAL_FRAMES, SMOOTH_WINDOW
+ *    - SPECTRUM_LEN, COL_AVG_RANGE, TEMPORAL_FRAMES, SMOOTH_WINDOW
  *    - DISPLAY_MAX_INTENSITY (display scale - NOT a data clamp; see
  *      spectrum_processing.h, raw data is never clamped)
  *  Also uses darkFrameCaptured + positionToRGB() from
@@ -174,8 +174,8 @@ void drawInfo(float *spectrum, float maxVal, float fps) {
 
     gfx->setCursor(10, TEXT_Y + 40);
     gfx->setTextColor(YELLOW);
-    gfx->printf("Rows:%d  TempAvg:%d/%d  Smooth:%d",
-                ROW_AVG_RANGE * 2 + 1, temporalCount, TEMPORAL_FRAMES, SMOOTH_WINDOW);
+    gfx->printf("Cols:%d  TempAvg:%d/%d  Smooth:%d",
+                COL_AVG_RANGE * 2 + 1, temporalCount, TEMPORAL_FRAMES, SMOOTH_WINDOW);
 
     gfx->setCursor(10, TEXT_Y + 55);
     if (darkFrameCaptured) {

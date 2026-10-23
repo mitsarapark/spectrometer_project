@@ -79,12 +79,22 @@ Arduino_Canvas *gfx = new Arduino_Canvas(320, 480, g, 0, 0, ROTATION);
 #define FRAME_HEIGHT      480
 #define PIXEL_FORMAT      PIXFORMAT_RGB565
 
-// Reading the CENTER ROW across columns (horizontal spectrum)
-#define CENTER_ROW        (FRAME_HEIGHT / 2)
-#define ROW_AVG_RANGE     10      // average this many rows above+below CENTER_ROW
-#define SPECTRUM_LEN      FRAME_WIDTH
+// Reading the CENTER COLUMN down every row (vertical spectrum).
+// The grating in this build disperses the spectrum vertically, so the
+// measured axis is the image row (0 = top .. FRAME_HEIGHT-1 = bottom).
+#define CENTER_COL        (FRAME_WIDTH / 2)
+#define COL_AVG_RANGE     10      // average this many columns left+right of CENTER_COL
+#define SPECTRUM_LEN      FRAME_HEIGHT
+
+// Set to 1 if the spectrum appears reversed on screen (red at the wrong
+// end); this flips the row order without touching anything else.
+#define SPECTRUM_INVERT   0
+
 #define TEMPORAL_FRAMES   4
 #define SMOOTH_WINDOW     7
+
+// How often the spectrum is re-measured and the LCD is refreshed.
+#define FRAME_INTERVAL_MS 300
 
 // Manual exposure & gain (tune these for your light source)
 #define MANUAL_EXPOSURE   300
@@ -178,7 +188,7 @@ h1 { color: #00d4ff; margin-bottom: 8px; }
     <img id="camImg" src="/capture" alt="Camera">
     <canvas id="camOverlay"></canvas>
   </div>
-  <div class="status">Auto-refreshes every 1 second. Yellow line = measured row.</div>
+  <div class="status">Auto-refreshes every 1 second. Yellow line + band = measured center column.</div>
 </div>
 </div>
 <script>
@@ -271,6 +281,13 @@ async function update() {
         document.getElementById('fps').textContent=j.fps.toFixed(1);
         document.getElementById('conn').textContent='Connected';
         document.getElementById('conn').style.color='#00ff88';
+        if (j.col !== undefined) {
+            camMeta.col = j.col;
+            camMeta.colRange = j.colRange;
+            camMeta.frameWidth = j.frameWidth;
+            camMeta.frameHeight = j.frameHeight;
+            if (document.getElementById('camImg').complete) resizeCamOverlay();
+        }
         drawSpectrum(j.spectrum, j.scale);
     }catch(e){
         document.getElementById('conn').textContent='Disconnected';
@@ -282,8 +299,12 @@ function updateCam() {
     document.getElementById('camImg').src='/capture?t='+Date.now();
 }
 
-// Yellow line overlay showing the measured row (center row) on the
-// camera snapshot - purely visual, client-side only.
+// Vertical line + shaded band overlay showing the measured center
+// column (and the +/- COL_AVG_RANGE columns averaged around it) on the
+// camera snapshot - purely visual, client-side only. Metadata comes
+// from /data so the overlay always matches the firmware constants.
+let camMeta = { col: 320, colRange: 10, frameWidth: 640, frameHeight: 480 };
+
 function resizeCamOverlay() {
     const img = document.getElementById('camImg');
     const ov = document.getElementById('camOverlay');
@@ -291,12 +312,19 @@ function resizeCamOverlay() {
     ov.height = img.clientHeight;
     const c = ov.getContext('2d');
     c.clearRect(0,0,ov.width,ov.height);
-    const y = ov.height/2;
+    if (!ov.width || !ov.height) return;
+
+    const cx = (camMeta.col / camMeta.frameWidth) * ov.width;
+    const half = (camMeta.colRange / camMeta.frameWidth) * ov.width;
+
+    c.fillStyle = 'rgba(255,221,0,0.18)';
+    c.fillRect(cx-half, 0, half*2, ov.height);
+
     c.strokeStyle = '#ffdd00';
     c.lineWidth = 2;
     c.beginPath();
-    c.moveTo(0,y);
-    c.lineTo(ov.width,y);
+    c.moveTo(cx,0);
+    c.lineTo(cx,ov.height);
     c.stroke();
 }
 document.getElementById('camImg').addEventListener('load', resizeCamOverlay);
@@ -398,6 +426,14 @@ void handleData() {
     json += String(webMaxVal, 1);
     json += ",\"scale\":";
     json += String((int)DISPLAY_MAX_INTENSITY);
+    json += ",\"col\":";
+    json += String(CENTER_COL);
+    json += ",\"colRange\":";
+    json += String(COL_AVG_RANGE);
+    json += ",\"frameWidth\":";
+    json += String(FRAME_WIDTH);
+    json += ",\"frameHeight\":";
+    json += String(FRAME_HEIGHT);
     json += ",\"fps\":";
     json += String(webFPS, 1);
     json += ",\"spectrum\":[";
@@ -443,7 +479,7 @@ void setup() {
     Serial.begin(115200);
     while (!Serial && millis() < 3000);
 
-    Serial.println("\n=== ESP32-S3 Spectrometer + Web (AP mode, row-center, RGB-separate) ===");
+    Serial.println("\n=== ESP32-S3 Spectrometer + Web (AP mode, column-center, RGB-separate) ===");
 
     pinMode(DARKFRAME_BUTTON_PIN, INPUT_PULLUP); // BOOT button: HIGH = not pressed, LOW = pressed
 
@@ -548,8 +584,8 @@ void loop() {
         return;
     }
 
-    // Spectrum update every 1 second
-    if (now - lastFrameTime < 1000) {
+    // Spectrum update at a fixed interval
+    if (now - lastFrameTime < FRAME_INTERVAL_MS) {
         return;
     }
     lastFrameTime = now;

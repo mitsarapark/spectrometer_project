@@ -4,8 +4,8 @@
 /* ==============================================================
  *  Requires the following to be #defined BEFORE including this file
  *  (set in spectrometer.ino):
- *    FRAME_WIDTH, FRAME_HEIGHT, CENTER_ROW, ROW_AVG_RANGE,
- *    SPECTRUM_LEN, TEMPORAL_FRAMES, SMOOTH_WINDOW
+ *    FRAME_WIDTH, FRAME_HEIGHT, CENTER_COL, COL_AVG_RANGE,
+ *    SPECTRUM_LEN, SPECTRUM_INVERT, TEMPORAL_FRAMES, SMOOTH_WINDOW
  *
  *  Design notes (per review):
  *   - RGB channels are kept SEPARATE all the way through the pipeline
@@ -44,19 +44,22 @@ uint8_t temporalIndex = 0;
 uint8_t temporalCount = 0; // how many real frames have been fed in so far (<= TEMPORAL_FRAMES)
 
 // ---------------- Extraction ----------------
-// Reads the CENTER ROW (averaged over +/- ROW_AVG_RANGE rows) across
-// every column -> one R/G/B value per column (horizontal spectrum).
+// Reads the CENTER COLUMN (averaged over +/- COL_AVG_RANGE columns)
+// down every row -> one R/G/B value per row (vertical spectrum).
+// The spectrum is indexed by row: index 0 = top of the sensor image.
 // Values are NOT clamped or combined here - raw per-channel averages.
+// Set SPECTRUM_INVERT to 1 if the spectrum appears reversed (e.g. red at
+// the top instead of the bottom) so the graph reads low->high wavelength.
 void extractSpectrum(camera_fb_t *fb, float *outR, float *outG, float *outB) {
-    int rowStart = CENTER_ROW - ROW_AVG_RANGE;
-    int rowEnd = CENTER_ROW + ROW_AVG_RANGE;
-    if (rowStart < 0) rowStart = 0;
-    if (rowEnd >= FRAME_HEIGHT) rowEnd = FRAME_HEIGHT - 1;
-    int numRows = rowEnd - rowStart + 1;
+    int colStart = CENTER_COL - COL_AVG_RANGE;
+    int colEnd = CENTER_COL + COL_AVG_RANGE;
+    if (colStart < 0) colStart = 0;
+    if (colEnd >= FRAME_WIDTH) colEnd = FRAME_WIDTH - 1;
+    int numCols = colEnd - colStart + 1;
 
-    for (int col = 0; col < FRAME_WIDTH; col++) {
+    for (int row = 0; row < FRAME_HEIGHT; row++) {
         uint32_t rSum = 0, gSum = 0, bSum = 0;
-        for (int row = rowStart; row <= rowEnd; row++) {
+        for (int col = colStart; col <= colEnd; col++) {
             int pixelIndex = row * FRAME_WIDTH + col;
             uint16_t pixel = ((uint16_t*)fb->buf)[pixelIndex];
 
@@ -72,9 +75,11 @@ void extractSpectrum(camera_fb_t *fb, float *outR, float *outG, float *outB) {
             gSum += g;
             bSum += b;
         }
-        outR[col] = rSum / (float)numRows;
-        outG[col] = gSum / (float)numRows;
-        outB[col] = bSum / (float)numRows;
+
+        int outIndex = SPECTRUM_INVERT ? (FRAME_HEIGHT - 1 - row) : row;
+        outR[outIndex] = rSum / (float)numCols;
+        outG[outIndex] = gSum / (float)numCols;
+        outB[outIndex] = bSum / (float)numCols;
     }
 }
 
