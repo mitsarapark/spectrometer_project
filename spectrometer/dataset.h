@@ -68,6 +68,14 @@ bool appendSample(float conc) {
     File f = LittleFS.open(DATASET_PATH, FILE_APPEND);
     if (!f) return false;
 
+    // Refuse to fill the partition: leave headroom for the firmware and
+    // LittleFS metadata.
+    if (f.size() >= CSV_MAX_BYTES) {
+        f.close();
+        Serial.println("Dataset full - clear it before recording more samples");
+        return false;
+    }
+
     if (f.size() == 0) {
         for (int i = 0; i < CSV_POINTS; i++) {
             f.print(pixelToNm(csvIndexFor(i)), 1);
