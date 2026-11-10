@@ -2,31 +2,40 @@
 
 เครื่อง spectrometer แบบพกพาบน **ESP32-S3-Touch-LCD-3.5B** (Waveshare)
 อ่านสเปกตรัมจากกล้อง onboard ที่ผ่าน grating (กระจายแนวตั้ง) จาก **คอลัมน์กลาง** ของภาพ
-แล้ววาดกราฟ intensity vs pixel position บนจอ LCD พร้อมเปิด WiFi AP ให้ดูภาพกล้อง + กราฟผ่านเว็บ
+วาดกราฟ intensity vs wavelength บนจอ LCD เปิด WiFi AP ให้ดูภาพกล้อง + กราฟผ่านเว็บ
+และรันโมเดล PLSR บนเครื่องเพื่อทำนายความเข้มข้นของสาร
 
 ## เอกสาร
 
 - [`AGENTS.md`](AGENTS.md) — คู่มือสำหรับ AI agent / ผู้พัฒนาต่อ
 - [`PROJECT_STATUS.md`](PROJECT_STATUS.md) — สถานะงาน, ค่าคอนฟิก, known issues, roadmap
+- [`ml/README.md`](ml/README.md) — ขั้นตอนเก็บ dataset และเทรนโมเดล
 
 ## โครงสร้าง
 
 ```
 spectrometer/            sketch หลัก
   spectrometer.ino       setup/loop, camera, WiFi/WebServer, HTML, pipeline
-  spectrum_processing.h  extraction, dark frame, averaging, combine
-  display.h              วาดกราฟ/แกน/ข้อมูลลง LCD
-final/, test/            โค้ดเก่า/ทดสอบ (reference เท่านั้น)
+  spectrum_processing.h  extraction, dark frame, averaging, combine, calibration
+  display.h              วาดกราฟ/แกน/ข้อมูล/ปุ่ม PREDICT ลง LCD
+  dataset.h              บันทึก CSV ลง LittleFS
+  inference.h            รัน PLS dot product บนเครื่อง
+  model_weights.h        โมเดล (placeholder จนกว่าจะเทรน)
+  touch.h                อ่าน touch AXS15231B
+ml/                      เทรน PLSR บน PC (train_plsr.py, augment.py)
+test/                    โค้ดทดสอบ (reference เท่านั้น)
 ```
 
 ## ฟีเจอร์
 
-- Dark frame capture (กดปุ่ม BOOT)
+- Dark frame capture (กด BOOT ค้าง >= 1.5 s)
 - อ่านสเปกตรัมแนวตั้งจากคอลัมน์กลาง ± ช่วงเฉลี่ย
-- Temporal averaging + moving average, เก็บ R/G/B แยก channel
-- กราฟ + color bar + peak/max/FPS บน LCD
+- Temporal averaging + moving average, เก็บ R/G/B แยก channel, รวมด้วย Rec.709
+- 2-point wavelength calibration (ค่าเริ่มต้นเป็น placeholder)
+- กราฟ + color bar + peak (nm)/max/FPS บน LCD
 - WiFi AP + หน้าเว็บแสดงกราฟและภาพกล้อง พร้อมเส้น/แถบแนวตั้งบอกตำแหน่งที่วัด
-- `SPECTRUM_INVERT` สำหรับกลับลำดับสเปกตรัม
+- เก็บ dataset CSV ลง flash ผ่านเว็บ แล้วดาวน์โหลดไปเทรน
+- On-device PLSR inference: แตะปุ่ม PREDICT บนจอ (หรือกด BOOT สั้น)
 
 ## Build / Flash
 
@@ -39,8 +48,17 @@ final/, test/            โค้ดเก่า/ทดสอบ (reference เ
 4. Verify / Upload
 5. ต่อ WiFi `ITIM-project` (password `itimsarapark`) แล้วเปิด `http://192.168.4.1`
 
+## ML quick start
+
+```bash
+cd ml
+python -m pip install -r requirements.txt
+python train_plsr.py --csv dataset.csv --unit "%"
+# คัดลอก spectrometer/model_weights.h แล้ว rebuild/flash
+```
+
 ## หมายเหตุ
 
-- แกน X ยังเป็น pixel index (ยังไม่ calibrated เป็น nm)
-- สีของกราฟเป็นเพียง cosmetic
+- ค่า calibration เป็น placeholder — ต้องวัดหลอด fluorescent จริง (405/546 nm)
 - ค่าข้อมูลดิบไม่ถูก clamp; clamp เฉพาะตอนวาดบนจอ
+- เปลี่ยน exposure/gain/calibration/COMBINE_MODE แล้วต้องเก็บ dataset ใหม่

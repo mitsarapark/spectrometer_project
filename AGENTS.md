@@ -7,41 +7,51 @@
 สร้างเครื่อง spectrometer แบบพกพาบนบอร์ด **ESP32-S3-Touch-LCD-3.5B** (Waveshare)
 โดยใช้กล้อง onboard อ่านสเปกตรัมแสงที่ผ่าน grating แล้ว:
 
-1. มีฟังก์ชัน **dark frame capture** (กดปุ่ม BOOT บนบอร์ด)
+1. มีฟังก์ชัน **dark frame capture**
 2. ดึงสเปกตรัมจาก **คอลัมน์กลาง** ของภาพ (สเปกตรัมกระจายแนวตั้ง)
-3. วาดกราฟ intensity vs pixel position ลงจอ LCD ในตัวเครื่อง
+3. วาดกราฟ intensity vs wavelength (nm) ลงจอ LCD ในตัวเครื่อง
 4. เปิด WiFi AP ให้เว็บเบราว์เซอร์ดู **ภาพจากกล้อง + กราฟ** พร้อมเส้น/แถบแนวตั้งบอกตำแหน่งที่วัด
+5. เก็บ dataset ลง flash ผ่านเว็บ เพื่อนำไปเทรน PLSR บน PC
+6. รันโมเดลบน ESP32 ทำนายความเข้มข้นของสารเมื่อกดปุ่มบนจอ
 
 ## 2. โครงสร้างไฟล์
 
 ```
 spectrometer/                 <-- sketch หลัก (ชื่อโฟลเดอร์ต้องตรงกับ .ino)
   spectrometer.ino            setup/loop, camera, WiFi/WebServer, HTML, pipeline orchestration
-  spectrum_processing.h       extraction, dark frame, temporal/spatial averaging, RGB->combined
-  display.h                   วาดกราฟ/แกน/color bar/ข้อมูล ลง LCD
-final/                        โค้ดเวอร์ชันเก่า (reference เท่านั้น อย่าแก้)
+  spectrum_processing.h       extraction, dark frame, averaging, combine, calibration
+  display.h                   วาดกราฟ/แกน/color bar/ข้อมูล/ปุ่ม PREDICT ลง LCD
+  dataset.h                   บันทึก CSV ลง LittleFS + นับ sample + clear
+  inference.h                 รัน PLS dot product บนเครื่อง
+  model_weights.h             โมเดลที่ generate จาก ml/ (placeholder = MODEL_READY 0)
+  touch.h                     อ่าน touch AXS15231B (fallback ไป BOOT ถ้าไม่เจอ)
+ml/                           เทรน PLSR บน PC
+  train_plsr.py               โหลด CSV -> augment -> CV -> export model_weights.h
+  augment.py                  เพิ่ม noise / baseline / gain drift
+  README.md                   ขั้นตอนเก็บข้อมูล + เทรน + flash
 test/                         โค้ดทดสอบ display/camera (reference เท่านั้น)
 PROJECT_STATUS.md             สถานะงาน + roadmap
 README.md                     ภาพรวม + วิธี build/flash
 ```
 
-หมายเหตุ: `files (4)/` ถูกย้ายมาเป็น `spectrometer/` แล้ว (ประวัติอยู่ใน git)
+หมายเหตุ: โฟลเดอร์ `final/` ถูกลบแล้ว (ประวัติยังอยู่ใน git) เพื่อกันการสับสนว่าเป็นเวอร์ชันล่าสุด
 
 ## 3. Hardware / Board settings
 
 - Board: **ESP32S3 Dev Module**
 - PSRAM: **OPI PSRAM** (จำเป็น เพราะ frame buffer RGB565 VGA + canvas)
-- Flash/Partition: **Huge APP (3MB No OTA/1MB SPIFFS)**
+- Flash/Partition: **Huge APP (3MB No OTA/1MB SPIFFS)** (LittleFS ใช้ partition นี้)
 - USB CDC On Boot: **Enabled** (ถ้าต้องการ Serial)
-- Libraries: `esp32-camera` (มากับ ESP32 core), `Arduino_GFX` (moononournation / GFX_Library_for_Arduino), `TCA9554`
+- Libraries: `esp32-camera` (มากับ ESP32 core), `Arduino_GFX` (moononournation), `TCA9554`
 
 ### Pin map ที่ใช้จริง (ห้ามเดา ใช้ค่านี้)
 
 LCD QSPI: CS=12, CLK=5, D0=1, D1=2, D2=3, D3=4, BL=6
 Camera: XCLK=38, SIOD=8, SIOC=7, D7..D0 = 21,39,40,42,46,48,47,45,
 VSYNC=17, HREF=18, PCLK=41, PWDN=-1, RESET=-1
-I2C (TCA9554): SDA=21, SCL=22
-Dark frame button: GPIO0 (BOOT, INPUT_PULLUP, active LOW)
+I2C (TCA9554 + touch): SDA=21, SCL=22
+Touch controller: AXS15231B @ I2C `0x3B`
+BOOT button: GPIO0 (INPUT_PULLUP, active LOW)
 
 ## 4. Data flow
 
@@ -51,16 +61,19 @@ esp_camera_fb_get() [RGB565 VGA 640x480]
   -> applyDarkFrameSubtraction()
   -> applyTemporalAverage()   TEMPORAL_FRAMES frames
   -> applyMovingAverage()     SMOOTH_WINDOW
-  -> combineForDisplay()      (R+G+B)/3 เพื่อวาดกราฟเท่านั้น (ข้อมูล R/G/B ดิบยังอยู่ครบ)
-  -> drawSpectrum()/drawColorBar()/drawInfo() -> gfx->flush()
-  -> /data JSON (downsample 80 จุด) + /capture JPEG
+  -> combineForDisplay()      Rec.709 luma (0.2126R + 0.7152G + 0.0722B)
+  -> drawSpectrum()/drawColorBar()/drawInfo()/drawPredictButton() -> gfx->flush()
+  -> /data JSON (80 จุด + nm + model/sample metadata) + /capture JPEG
+  -> /record?conc=.. (LittleFS CSV) -> /dataset.csv -> ml/train_plsr.py
+  -> predictConcentration(): dot product บน spectrumCombined
 ```
 
 สำคัญ:
-- **ห้าม clamp ค่าข้อมูลจริง** ที่ 255; การ clamp เกิดเฉพาะตอน map เป็นพิกัด pixel บนจอ (`DISPLAY_MAX_INTENSITY`)
-- ค่า RGB ถูกเก็บแยก channel ตลอด pipeline เพื่อรองรับงานวิเคราะห์ในอนาคต
-- ตอนนี้แกน X เป็น **pixel index** ยังไม่ calibrated เป็น nm (สีเป็นเพียง cosmetic)
-- `SPECTRUM_INVERT` ใน `spectrometer.ino` ใช้กลับลำดับ row ถ้าภาพสเปกตรัมกลับหัว
+- **ห้าม clamp ค่าข้อมูลจริง** ที่ 255; clamp เฉพาะตอน map เป็นพิกัด pixel บนจอ
+- ค่า RGB ถูกเก็บแยก channel ตลอด pipeline; `combineForDisplay()` ใช้เฉพาะกราฟ/CSV/โมเดล
+- แกน X เป็น nm จาก 2-point calibration (ค่าเริ่มต้นเป็น placeholder)
+- `SPECTRUM_INVERT` กลับลำดับ row ถ้าภาพสเปกตรัมกลับหัว
+- `CSV_POINTS` ต้องเท่ากับ `MODEL_INPUT_DIM` (มี `#error` ตรวจให้แล้ว)
 
 ## 5. การ build / flash
 
@@ -72,26 +85,49 @@ esp_camera_fb_get() [RGB565 VGA 640x480]
 3. Verify/Upload
 4. ต่อ WiFi `ITIM-project` (password `itimsarapark`) แล้วเปิด `http://192.168.4.1`
 
-## 6. กติกาการทำงาน (สำคัญ)
+## 6. การใช้งานปุ่ม
+
+| การกระทำ | ผล |
+|---|---|
+| แตะปุ่ม **PREDICT** บนจอ | ทำนายความเข้มข้น (ถ้า `MODEL_READY 1`) |
+| กด BOOT สั้น (< 1.5 s) | ทำนายความเข้มข้น (สำรองเมื่อ touch ใช้ไม่ได้) |
+| กด BOOT ค้าง (>= 1.5 s) | จับ dark frame |
+
+## 7. ML workflow (สรุป)
+
+1. วัด sample ที่ทราบความเข้มข้น → หน้าเว็บกรอกค่า → **Record sample**
+2. ทำซ้ำหลายความเข้มข้น (แนะนำ >= 20 samples)
+3. **Download CSV** → `ml/train_plsr.py --csv dataset.csv --unit "<หน่วย>"`
+4. คัดลอก `model_weights.h` ที่ได้ไปทับใน `spectrometer/`
+5. Rebuild + flash → ปุ่ม PREDICT ใช้งานได้
+
+รายละเอียดอยู่ใน `ml/README.md` และ `PROJECT_STATUS.md`
+
+## 8. กติกาการทำงาน (สำคัญ)
 
 - **ทุกครั้งที่มีการแก้ไขไฟล์ ให้ commit ด้วย git ทันที** หลังแก้น้อยๆ เสร็จและตรวจแล้ว
 - ก่อน commit: `git status`, `git diff`, ตรวจว่าไม่มี secret
 - ข้อความ commit สั้น ตรงงาน ใช้ prefix `feat:`, `fix:`, `refactor:`, `docs:`, `chore:`
 - ห้าม commit/push ขึ้น remote เอง เว้นแต่ผู้ใช้สั่ง
-- หลีกเลี่ยงการใส่ comment ที่ไม่จำเป็น; โค้ดมี comment อธิบายส่วนสำคัญอยู่แล้ว
+- หลีกเลี่ยง comment ที่ไม่จำเป็น; โค้ดมี comment อธิบายส่วนสำคัญอยู่แล้ว
 - ถ้าไม่แน่ใจเรื่อง hardware/tuning ให้ถามผู้ใช้ก่อนเดา
 
-## 7. Known issues / gotchas
+## 9. Known issues / gotchas
 
-- `/capture` เรียก `esp_camera_fb_get()` แยกจาก loop ทำให้บางรอบ frame ถูกใช้ไป (ยอมรับได้ในเวอร์ชันนี้)
+- **ค่า calibration เป็น placeholder** (405 nm @ row 40, 546 nm @ row 440) ต้องวัดจากหลอด fluorescent จริงแล้วแก้ `CAL_*`
+- **Touch ยังไม่ยืนยันบนฮาร์ดแวร์จริง**: โค้ดสแกน `0x3B` บน Wire (SDA=21/SCL=22) ถ้าไม่เจอจะ fallback ไป BOOT อัตโนมัติ; ถ้าใช้ไม่ได้ให้ลองสแกน bus 8/7
+- `/capture` เรียก `esp_camera_fb_get()` แยกจาก loop ทำให้บางรอบ frame ถูกใช้ไป
 - Frame rate จริงจำกัดด้วย canvas flush + JPEG conversion; `FRAME_INTERVAL_MS` = 300 ms
 - `MANUAL_EXPOSURE` / `MANUAL_GAIN` ต้อง tune ตามแหล่งแสงจริง (default 300 / 0)
-- ยังไม่มี wavelength calibration, ยังไม่มี Fe analysis
-- บอร์ด Waveshare บาง revision ต้อง init PMU (AXP2101) ก่อนใช้กล้อง — ดูตัวอย่างใน `test/camera_server/`; เวอร์ชันหลักยังไม่ทำ
+- `/record` จะปฏิเสธถ้าข้อมูลสเปกตรัมเก่าเกิน 3 วินาที
+- เปลี่ยน exposure/gain/calibration/COMBINE_MODE แล้ว **ต้องเก็บ dataset ใหม่และเทรนใหม่**
+- ยังไม่มี wavelength calibration อัตโนมัติ และยังไม่มี Fe analysis
 
-## 8. ขั้นตอนตรวจงานก่อนส่ง
+## 10. ขั้นตอนตรวจงานก่อนส่ง
 
 1. ตรวจ `SPECTRUM_LEN`, ขนาด buffer, index bounds ให้ตรงกัน (ปัจจุบัน = FRAME_HEIGHT = 480)
 2. ตรวจว่าไม่มี identifier เก่า (`CENTER_ROW`, `ROW_AVG_RANGE`) หลงเหลือ
 3. ถ้าแก้ HTML/JS ให้ตรวจว่า `handleData()` ส่ง field ที่ JS ใช้ครบ
-4. อัปเดต `PROJECT_STATUS.md` เมื่อเพิ่ม/ลดฟีเจอร์
+   (`peakNm`, `nmStart`, `nmEnd`, `modelReady`, `hasPred`, `pred`, `modelUnit`, `samples`)
+4. ถ้าแก้ `model_weights.h` ให้ตรวจ `MODEL_INPUT_DIM` == `CSV_POINTS` == จำนวนคอลัมน์ CSV
+5. อัปเดต `PROJECT_STATUS.md` เมื่อเพิ่ม/ลดฟีเจอร์
