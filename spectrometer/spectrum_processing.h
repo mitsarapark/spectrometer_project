@@ -5,7 +5,9 @@
  *  Requires the following to be #defined BEFORE including this file
  *  (set in spectrometer.ino):
  *    FRAME_WIDTH, FRAME_HEIGHT, CENTER_COL, COL_AVG_RANGE,
- *    SPECTRUM_LEN, SPECTRUM_INVERT, TEMPORAL_FRAMES, SMOOTH_WINDOW
+ *    SPECTRUM_LEN, SPECTRUM_INVERT, TEMPORAL_FRAMES, SMOOTH_WINDOW,
+ *    COMBINE_MODE (COMBINE_REC709 / COMBINE_REC601 / COMBINE_AVERAGE),
+ *    CAL_PIXEL_1, CAL_NM_1, CAL_PIXEL_2, CAL_NM_2
  *
  *  Design notes (per review):
  *   - RGB channels are kept SEPARATE all the way through the pipeline
@@ -179,36 +181,68 @@ void applyMovingAverage(float *input, float *output, int len, int window) {
 }
 
 // ---------------- Combine RGB -> single value FOR DISPLAY ONLY ----------------
-// This is a simple (R+G+B)/3 average - not an absolute optical power
-// measurement (camera channels have unequal spectral sensitivity), but
-// good enough as a visualization/combined-intensity metric per the
-// review notes. Real per-channel data stays intact in
-// spectrumSmoothR/G/B for any future analysis.
+// Weights follow a standard luma definition instead of a flat average:
+//   Rec.709 : 0.2126 R + 0.7152 G + 0.0722 B  (sRGB / HDTV)
+//   Rec.601 : 0.299  R + 0.587  G + 0.114  B  (SDTV / JPEG)
+//   Average : (R + G + B) / 3
+// Every option keeps the weights summing to 1.0, so the 0..255-ish
+// intensity range (and DISPLAY_MAX_INTENSITY) stays comparable.
+// Note: the sensor output is gamma-encoded, so true Rec.709 luma would
+// require linearising first; this is the common approximation and it is
+// applied consistently to both the LCD and the CSV dataset.
+// Real per-channel data stays intact in spectrumSmoothR/G/B.
 void combineForDisplay(float *r, float *g, float *b, float *out) {
+#if COMBINE_MODE == COMBINE_REC601
+    const float wr = 0.299f, wg = 0.587f, wb = 0.114f;
+#elif COMBINE_MODE == COMBINE_AVERAGE
+    const float wr = 1.0f / 3.0f, wg = 1.0f / 3.0f, wb = 1.0f / 3.0f;
+#else
+    const float wr = 0.2126f, wg = 0.7152f, wb = 0.0722f;
+#endif
     for (int i = 0; i < SPECTRUM_LEN; i++) {
-        out[i] = (r[i] + g[i] + b[i]) / 3.0f;
+        out[i] = wr * r[i] + wg * g[i] + wb * b[i];
     }
 }
 
-// ---------------- Position -> RGB (cosmetic gradient only, NOT calibrated) ----------------
-// Maps a 0..1 position fraction to an approximate visible-light color,
-// purely so the graph is easier to read. Assumes an approximate
-// 400-700nm range spread evenly across the x-axis - this is NOT a
-// wavelength calibration (that is a later project phase).
-void positionToRGB(float frac, uint8_t &r, uint8_t &g, uint8_t &b) {
-    float wl = 400.0f + frac * 300.0f;
+// ---------------- Pixel index -> wavelength (2-point linear calibration) ----------------
+// CAL_PIXEL_1/2 are row indices and CAL_NM_1/2 the wavelengths of two
+// known lines (e.g. a fluorescent tube's 405 nm and 546 nm peaks).
+// Until real values are measured this is a placeholder mapping.
+inline float pixelToNm(float idx) {
+    const int span = (int)CAL_PIXEL_2 - (int)CAL_PIXEL_1;
+    if (span == 0) return (float)CAL_NM_1;
+    const float slope = ((float)CAL_NM_2 - (float)CAL_NM_1) / (float)span;
+    return (float)CAL_NM_1 + slope * (idx - (float)CAL_PIXEL_1);
+}
+
+// ---------------- Wavelength -> approximate visible color ----------------
+// Cosmetic only: used for the graph fill and the color bar so the plot is
+// easier to read. Values outside 380..780 nm are clamped.
+void wavelengthToRGB(float wl, uint8_t &r, uint8_t &g, uint8_t &b) {
+    if (wl < 380.0f) wl = 380.0f;
+    if (wl > 780.0f) wl = 780.0f;
+
     float rr = 0, gg = 0, bb = 0;
 
-    if (wl >= 400 && wl < 440) { rr = -(wl - 440) / 40.0f; bb = 1.0; }
-    else if (wl < 490) { gg = (wl - 440) / 50.0f; bb = 1.0; }
-    else if (wl < 510) { gg = 1.0; bb = -(wl - 510) / 20.0f; }
-    else if (wl < 580) { rr = (wl - 510) / 70.0f; gg = 1.0; }
-    else if (wl < 645) { rr = 1.0; gg = -(wl - 645) / 65.0f; }
+    if (wl < 440) { rr = -(wl - 440) / (440 - 380); bb = 1.0; }
+    else if (wl < 490) { gg = (wl - 440) / (490 - 440); bb = 1.0; }
+    else if (wl < 510) { gg = 1.0; bb = -(wl - 510) / (510 - 490); }
+    else if (wl < 580) { rr = (wl - 510) / (580 - 510); gg = 1.0; }
+    else if (wl < 645) { rr = 1.0; gg = -(wl - 645) / (645 - 580); }
     else { rr = 1.0; }
 
-    r = (uint8_t)(rr * 255);
-    g = (uint8_t)(gg * 255);
-    b = (uint8_t)(bb * 255);
+    float factor = 1.0f;
+    if (wl < 420) factor = 0.3f + 0.7f * (wl - 380) / (420 - 380);
+    else if (wl > 700) factor = 0.3f + 0.7f * (780 - wl) / (780 - 700);
+
+    r = (uint8_t)(rr * factor * 255);
+    g = (uint8_t)(gg * factor * 255);
+    b = (uint8_t)(bb * factor * 255);
+}
+
+// Convenience wrapper: 0..1 position along the spectrum -> color.
+void positionToRGB(float frac, uint8_t &r, uint8_t &g, uint8_t &b) {
+    wavelengthToRGB(pixelToNm(frac * (SPECTRUM_LEN - 1)), r, g, b);
 }
 
 #endif // SPECTRUM_PROCESSING_H

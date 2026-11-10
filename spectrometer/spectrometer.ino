@@ -100,8 +100,30 @@ Arduino_Canvas *gfx = new Arduino_Canvas(320, 480, g, 0, 0, ROTATION);
 #define MANUAL_EXPOSURE   300
 #define MANUAL_GAIN       0
 
-// Onboard BOOT button, used to trigger dark frame capture
+// Onboard BOOT button: short press = predict, long press = dark frame
 #define DARKFRAME_BUTTON_PIN  0
+#define DARKFRAME_HOLD_MS     1500
+
+// How the R/G/B channels are combined into the single displayed /
+// recorded intensity value (see combineForDisplay()).
+#define COMBINE_REC709        0
+#define COMBINE_REC601        1
+#define COMBINE_AVERAGE       2
+#define COMBINE_MODE          COMBINE_REC709
+
+// Two-point wavelength calibration (placeholder values - replace with
+// the row indices of two known lines, e.g. a fluorescent tube's 405 nm
+// and 546 nm peaks, after measuring them on the device).
+#define CAL_PIXEL_1           40
+#define CAL_NM_1              405.0f
+#define CAL_PIXEL_2           440
+#define CAL_NM_2              546.0f
+
+// Touch panel (AXS15231B integrated touch controller on the shared
+// Wire bus). Set TOUCH_ENABLE 0 if the controller is not detected.
+#define TOUCH_ENABLE          1
+#define TOUCH_I2C_ADDR        0x3B
+#define TOUCH_POLL_MS         60
 
 // Display layout (x=position, y=intensity)
 #define DISP_WIDTH        320
@@ -125,10 +147,11 @@ Arduino_Canvas *gfx = new Arduino_Canvas(320, 480, g, 0, 0, ROTATION);
 // on-screen warning that appears when a real value exceeds this).
 #define DISPLAY_MAX_INTENSITY  300.0f
 
-// NOTE: calibration is intentionally NOT implemented yet. The x-axis
-// represents raw pixel position (0..SPECTRUM_LEN-1), not wavelength in
-// nm. Color gradients are cosmetic only (see positionToRGB()).
+// The x-axis is wavelength in nm via the 2-point calibration above
+// (placeholder until real reference lines are measured). Colors are
+// cosmetic (see wavelengthToRGB()).
 
+#include "model_weights.h"
 #include "spectrum_processing.h"
 #include "display.h"
 
@@ -138,6 +161,14 @@ Arduino_Canvas *gfx = new Arduino_Canvas(320, 480, g, 0, 0, ROTATION);
 const char* ssid     = "ITIM-project";
 const char* password = "itimsarapark";
 WebServer server(80);
+
+#include "inference.h"
+#include "dataset.h"
+#include "touch.h"
+
+// Timestamp of the last completed spectrum measurement. /record rejects
+// requests when this is stale so a sample can't be saved with old data.
+unsigned long lastSpectrumMs = 0;
 
 // Shared data for web endpoint (updated in loop, read by handler)
 float webPeakPos  = 0;   // peak position (pixel index), not wavelength
@@ -170,6 +201,10 @@ h1 { color: #00d4ff; margin-bottom: 8px; }
 #camImg { width: 100%; border: 1px solid #333; display: block; border-radius: 4px; background: #000; }
 #camOverlay { position: absolute; top: 0; left: 0; width: 100%; height: 100%; pointer-events: none; }
 .status { color: #666; font-size: 12px; margin-top: 10px; }
+.row { display: flex; gap: 10px; align-items: center; flex-wrap: wrap; }
+.row input { background: #0a0a0f; color: #fff; border: 1px solid #444; border-radius: 4px; padding: 6px 8px; width: 110px; }
+.row button { background: #1c3b52; color: #bde8ff; border: 1px solid #2f6b93; border-radius: 4px; padding: 7px 12px; cursor: pointer; font-size: 13px; }
+.row button:hover { background: #265172; }
 </style>
 </head>
 <body>
@@ -177,8 +212,9 @@ h1 { color: #00d4ff; margin-bottom: 8px; }
 <h1>🔬 ESP32-S3 Spectrometer</h1>
 <div class="sub">Live Spectrum + Web Camera | <span id="conn">Connecting...</span></div>
 <div class="info">
-  <div class="box"><h3>Peak Position</h3><div id="peak">-- px</div></div>
+  <div class="box"><h3>Peak Wavelength</h3><div id="peak">-- nm</div></div>
   <div class="box"><h3>Max Intensity</h3><div id="max">--</div></div>
+  <div class="box"><h3>Concentration</h3><div id="conc">--</div></div>
   <div class="box"><h3>FPS</h3><div id="fps">--</div></div>
 </div>
 <canvas id="spectrumCanvas" width="640" height="300"></canvas>
@@ -190,32 +226,48 @@ h1 { color: #00d4ff; margin-bottom: 8px; }
   </div>
   <div class="status">Auto-refreshes every 1 second. Yellow line + band = measured center column.</div>
 </div>
+<div class="cam-box" style="margin-top:20px">
+  <h3>🧪 Dataset</h3>
+  <div class="row">
+    <label for="concInput">Concentration</label>
+    <input id="concInput" type="number" step="0.01" value="0">
+    <button id="recordBtn">Record sample</button>
+    <a id="dlLink" href="/dataset.csv"><button>Download CSV</button></a>
+    <button id="clearBtn">Clear</button>
+  </div>
+  <div class="status" id="dsStatus">samples: --</div>
+</div>
 </div>
 <script>
 const canvas = document.getElementById('spectrumCanvas');
 const ctx = canvas.getContext('2d');
 
-// Cosmetic-only gradient: maps a 0..1 position fraction to an
-// approximate visible-light color (assumes ~400-700nm spread evenly
-// across the x-axis). This is NOT a calibrated wavelength mapping.
-function positionToRGB(frac) {
-    const wl = 400 + frac * 300;
+// Cosmetic-only wavelength -> color mapping (380..780 nm), used for the
+// graph line and the color gradient. Values outside the visible range are
+// clamped by the firmware's calibration, so no extra handling here.
+function nmToRGB(wl) {
+    if (wl < 380) wl = 380;
+    if (wl > 780) wl = 780;
     let r=0,g=0,b=0;
-    if(wl>=400&&wl<440){r=-(wl-440)/(440-400);g=0;b=1;}
-    else if(wl>=440&&wl<490){r=0;g=(wl-440)/(490-440);b=1;}
-    else if(wl>=490&&wl<510){r=0;g=1;b=-(wl-510)/(510-490);}
-    else if(wl>=510&&wl<580){r=(wl-510)/(580-510);g=1;b=0;}
-    else if(wl>=580&&wl<645){r=1;g=-(wl-645)/(645-580);b=0;}
-    else if(wl>=645&&wl<=700){r=1;g=0;b=0;}
-    return `rgb(${Math.floor(r*255)},${Math.floor(g*255)},${Math.floor(b*255)})`;
+    if(wl<440){r=-(wl-440)/(440-380);b=1;}
+    else if(wl<490){g=(wl-440)/(490-440);b=1;}
+    else if(wl<510){g=1;b=-(wl-510)/(510-490);}
+    else if(wl<580){r=(wl-510)/(580-510);g=1;}
+    else if(wl<645){r=1;g=-(wl-645)/(645-580);}
+    else {r=1;}
+    let f=1;
+    if(wl<420)f=0.3+0.7*(wl-380)/(420-380);
+    else if(wl>700)f=0.3+0.7*(780-wl)/(780-700);
+    return `rgb(${Math.floor(r*f*255)},${Math.floor(g*f*255)},${Math.floor(b*f*255)})`;
 }
 
 // data = real (unclamped) intensity values. scale = the display scale
 // the firmware is currently using (same one shown on the LCD) so the
 // web graph and LCD graph read consistently. A per-frame value above
 // `scale` is clamped only for the on-screen pixel position - never in
-// the underlying data.
-function drawSpectrum(data, scale) {
+// the underlying data. nmStart/nmEnd come from the on-device 2-point
+// wavelength calibration.
+function drawSpectrum(data, scale, nmStart, nmEnd) {
     const W = canvas.width, H = canvas.height;
     const left = 45, right = W - 10, top = 10, bottom = H - 30;
     const gw = right - left, gh = bottom - top;
@@ -248,14 +300,14 @@ function drawSpectrum(data, scale) {
         ctx.fillText(val, left-5, y+4);
     }
 
-    // X axis labels (pixel position)
+    // X axis labels (wavelength, nm)
     ctx.textAlign = 'center';
     for(let i=0;i<=8;i++){
         let x = left + (i*gw/8);
-        let pos = Math.round(i * data.length / 8);
-        ctx.fillText(pos, x, bottom+15);
+        let nm = nmStart + (i/8)*(nmEnd-nmStart);
+        ctx.fillText(Math.round(nm), x, bottom+15);
     }
-    ctx.fillText('Position (pixel index, not calibrated)', left+gw/2, bottom+27);
+    ctx.fillText('Wavelength (nm)', left+gw/2, bottom+27);
 
     let prevX=-1, prevY=-1;
     ctx.lineWidth = 2;
@@ -265,7 +317,7 @@ function drawSpectrum(data, scale) {
         let normalized = Math.min(1, Math.max(0, data[i]/scale));
         let y = bottom - normalized*gh;
         if(prevX>=0){
-            ctx.strokeStyle = positionToRGB(frac);
+            ctx.strokeStyle = nmToRGB(nmStart + frac*(nmEnd-nmStart));
             ctx.beginPath();ctx.moveTo(prevX,prevY);ctx.lineTo(x,y);ctx.stroke();
         }
         prevX=x; prevY=y;
@@ -276,9 +328,13 @@ async function update() {
     try {
         const r=await fetch('/data');
         const j=await r.json();
-        document.getElementById('peak').textContent=j.peak.toFixed(0)+' px';
+        document.getElementById('peak').textContent=j.peakNm.toFixed(0)+' nm';
         document.getElementById('max').textContent=j.max.toFixed(1)+' (scale 0-'+j.scale+')';
         document.getElementById('fps').textContent=j.fps.toFixed(1);
+        document.getElementById('conc').textContent = j.modelReady
+            ? (j.hasPred ? j.pred.toFixed(2)+' '+j.modelUnit : 'not run yet')
+            : 'no model';
+        document.getElementById('dsStatus').textContent = 'samples: '+j.samples;
         document.getElementById('conn').textContent='Connected';
         document.getElementById('conn').style.color='#00ff88';
         if (j.col !== undefined) {
@@ -288,12 +344,43 @@ async function update() {
             camMeta.frameHeight = j.frameHeight;
             if (document.getElementById('camImg').complete) resizeCamOverlay();
         }
-        drawSpectrum(j.spectrum, j.scale);
+        drawSpectrum(j.spectrum, j.scale, j.nmStart, j.nmEnd);
     }catch(e){
         document.getElementById('conn').textContent='Disconnected';
         document.getElementById('conn').style.color='#ff4444';
     }
 }
+
+async function recordSample() {
+    const c = document.getElementById('concInput').value;
+    const el = document.getElementById('dsStatus');
+    try {
+        const r = await fetch('/record?conc='+encodeURIComponent(c));
+        const j = await r.json();
+        el.textContent = j.ok ? ('recorded, samples: '+j.count) : ('error: '+j.err);
+        el.style.color = j.ok ? '#00ff88' : '#ff4444';
+    } catch (e) {
+        el.textContent = 'error: request failed';
+        el.style.color = '#ff4444';
+    }
+}
+
+async function clearDataset() {
+    if (!confirm('Delete all recorded samples?')) return;
+    const el = document.getElementById('dsStatus');
+    try {
+        const r = await fetch('/dataset/clear');
+        const j = await r.json();
+        el.textContent = j.ok ? 'dataset cleared' : 'error: '+j.err;
+        el.style.color = j.ok ? '#00ff88' : '#ff4444';
+    } catch (e) {
+        el.textContent = 'error: request failed';
+        el.style.color = '#ff4444';
+    }
+}
+
+document.getElementById('recordBtn').addEventListener('click', recordSample);
+document.getElementById('clearBtn').addEventListener('click', clearDataset);
 
 function updateCam() {
     document.getElementById('camImg').src='/capture?t='+Date.now();
@@ -422,10 +509,16 @@ void handleData() {
     // consistent - the values themselves are never clamped.
     String json = "{\"peak\":";
     json += String(webPeakPos, 0);
+    json += ",\"peakNm\":";
+    json += String(pixelToNm(webPeakPos), 1);
     json += ",\"max\":";
     json += String(webMaxVal, 1);
     json += ",\"scale\":";
     json += String((int)DISPLAY_MAX_INTENSITY);
+    json += ",\"nmStart\":";
+    json += String(pixelToNm(0), 1);
+    json += ",\"nmEnd\":";
+    json += String(pixelToNm(SPECTRUM_LEN - 1), 1);
     json += ",\"col\":";
     json += String(CENTER_COL);
     json += ",\"colRange\":";
@@ -434,6 +527,16 @@ void handleData() {
     json += String(FRAME_WIDTH);
     json += ",\"frameHeight\":";
     json += String(FRAME_HEIGHT);
+    json += ",\"modelReady\":";
+    json += MODEL_READY ? "true" : "false";
+    json += ",\"hasPred\":";
+    json += hasPrediction ? "true" : "false";
+    json += ",\"pred\":";
+    json += String(lastPrediction, 3);
+    json += ",\"modelUnit\":\"";
+    json += MODEL_UNIT;
+    json += "\",\"samples\":";
+    json += String(datasetSampleCount);
     json += ",\"fps\":";
     json += String(webFPS, 1);
     json += ",\"spectrum\":[";
@@ -470,6 +573,49 @@ void handleCapture() {
     server.send(200, "image/jpeg", "");
     server.client().write(jpg_buf, jpg_len);
     free(jpg_buf);
+}
+
+// ============================================================
+// DATASET ENDPOINTS
+// ============================================================
+void handleRecord() {
+    if (!server.hasArg("conc")) {
+        server.send(400, "application/json", "{\"ok\":false,\"err\":\"missing conc\"}");
+        return;
+    }
+    if (lastSpectrumMs == 0) {
+        server.send(409, "application/json", "{\"ok\":false,\"err\":\"no spectrum yet\"}");
+        return;
+    }
+    if (millis() - lastSpectrumMs > 3000) {
+        server.send(409, "application/json", "{\"ok\":false,\"err\":\"spectrum is stale\"}");
+        return;
+    }
+    float conc = server.arg("conc").toFloat();
+    if (!appendSample(conc)) {
+        server.send(500, "application/json", "{\"ok\":false,\"err\":\"write failed\"}");
+        return;
+    }
+    String out = "{\"ok\":true,\"count\":";
+    out += String(datasetSampleCount);
+    out += "}";
+    server.send(200, "application/json", out);
+}
+
+void handleDatasetDownload() {
+    File f = LittleFS.open(DATASET_PATH, FILE_READ);
+    if (!f) {
+        server.send(404, "text/plain", "dataset not found");
+        return;
+    }
+    server.sendHeader("Content-Disposition", "attachment; filename=\"dataset.csv\"");
+    server.streamFile(f, "text/csv");
+    f.close();
+}
+
+void handleDatasetClear() {
+    clearDataset();
+    server.send(200, "application/json", "{\"ok\":true}");
 }
 
 // ============================================================
@@ -525,16 +671,112 @@ void setup() {
     server.on("/", HTTP_GET, handleRoot);
     server.on("/data", HTTP_GET, handleData);
     server.on("/capture", HTTP_GET, handleCapture);
+    server.on("/record", HTTP_GET, handleRecord);
+    server.on("/dataset.csv", HTTP_GET, handleDatasetDownload);
+    server.on("/dataset/clear", HTTP_GET, handleDatasetClear);
     server.begin();
     Serial.println("Web server started on port 80");
+
+    // Dataset storage + touch panel
+    initDataset();
+    initTouch();
 
     // Initial LCD screen
     gfx->fillScreen(BLACK);
     drawAxes();
     drawColorBar();
+    drawPredictButton(false);
     gfx->flush();
 
     Serial.println("Setup complete. Starting capture...");
+}
+
+// ============================================================
+// BUTTON HANDLING (BOOT short/long press, on-screen touch button)
+// ============================================================
+unsigned long lastFrameTime = 0;
+unsigned long popupUntil = 0;
+float popupValue = 0.0f;
+bool popupOk = false;
+
+void triggerPrediction() {
+    float v = 0.0f;
+    bool ok = runPrediction(v);
+    popupValue = v;
+    popupOk = ok;
+    popupUntil = millis() + 4000;
+    Serial.printf("Predict: %s value=%.3f\n", ok ? "ok" : "not-ready", v);
+}
+
+void runDarkFrame() {
+    gfx->fillScreen(BLACK);
+    gfx->setTextSize(1);
+    gfx->setTextColor(YELLOW);
+    gfx->setCursor(10, DISP_HEIGHT / 2);
+    gfx->println("Capturing dark frame...");
+    gfx->println("Cover the spectrometer slit!");
+    gfx->flush();
+    delay(2000);
+
+    captureDarkFrame(); // also resets the temporal buffer internally
+
+    gfx->fillScreen(BLACK);
+    gfx->setTextColor(GREEN);
+    gfx->setCursor(10, DISP_HEIGHT / 2);
+    gfx->println("Dark frame captured!");
+    gfx->flush();
+    delay(1000);
+
+    gfx->fillScreen(BLACK);
+    drawAxes();
+    drawColorBar();
+    drawPredictButton(false);
+    gfx->flush();
+    lastFrameTime = millis();
+}
+
+// BOOT button: short press = predict, long press (>= DARKFRAME_HOLD_MS)
+// = dark frame. Acting on release keeps both actions unambiguous.
+void handleBootButton() {
+    static bool wasPressed = false;
+    static unsigned long pressStart = 0;
+
+    bool pressed = (digitalRead(DARKFRAME_BUTTON_PIN) == LOW);
+
+    if (pressed && !wasPressed) {
+        wasPressed = true;
+        pressStart = millis();
+    } else if (!pressed && wasPressed) {
+        wasPressed = false;
+        if (millis() - pressStart >= DARKFRAME_HOLD_MS) runDarkFrame();
+        else triggerPrediction();
+    }
+}
+
+void handleTouchButton() {
+    static unsigned long lastPoll = 0;
+    static bool wasDown = false;
+
+    if (!touchAvailable) return;
+
+    unsigned long now = millis();
+    if (now - lastPoll < TOUCH_POLL_MS) return;
+    lastPoll = now;
+
+    uint16_t x = 0, y = 0;
+    bool down = readTouch(x, y);
+    bool inside = down && pointInPredictButton(x, y);
+
+    if (inside && !wasDown) {
+        wasDown = true;
+        drawPredictButton(true);
+        gfx->flush();
+        triggerPrediction();
+    } else if (!down && wasDown) {
+        wasDown = false;
+        drawPredictButton(false);
+        gfx->flush();
+    }
 }
 
 // ============================================================
@@ -544,45 +786,14 @@ void loop() {
     // Always handle web clients (non-blocking)
     server.handleClient();
 
-    static unsigned long lastFrameTime = 0;
+    handleBootButton();
+    handleTouchButton();
+
     static int frameCount = 0;
     static unsigned long fpsTimer = 0;
     static float fps = 0;
 
     unsigned long now = millis();
-
-    // Check BOOT button for dark frame (debounced: wait for release too)
-    if (digitalRead(DARKFRAME_BUTTON_PIN) == LOW) {
-        delay(50); // simple debounce
-        if (digitalRead(DARKFRAME_BUTTON_PIN) == LOW) {
-            gfx->fillScreen(BLACK);
-            gfx->setCursor(10, DISP_HEIGHT / 2);
-            gfx->setTextColor(YELLOW);
-            gfx->println("Capturing dark frame...");
-            gfx->println("Cover the spectrometer slit!");
-            gfx->flush();
-            delay(2000);
-
-            captureDarkFrame(); // also resets temporal buffer internally
-
-            gfx->fillScreen(BLACK);
-            gfx->setCursor(10, DISP_HEIGHT / 2);
-            gfx->setTextColor(GREEN);
-            gfx->println("Dark frame captured!");
-            gfx->flush();
-            delay(1000);
-
-            // wait for button release before resuming, avoids re-triggering
-            while (digitalRead(DARKFRAME_BUTTON_PIN) == LOW) delay(10);
-
-            gfx->fillScreen(BLACK);
-            drawAxes();
-            drawColorBar();
-            gfx->flush();
-            lastFrameTime = millis();
-        }
-        return;
-    }
 
     // Spectrum update at a fixed interval
     if (now - lastFrameTime < FRAME_INTERVAL_MS) {
@@ -614,9 +825,8 @@ void loop() {
     memcpy(spectrumSmoothG, tmpG, sizeof(tmpG));
     memcpy(spectrumSmoothB, tmpB, sizeof(tmpB));
 
-    // Combine to a single value ONLY for graphing/display (real R/G/B
-    // data stays intact in spectrumSmoothR/G/B for future use, e.g. Fe
-    // analysis, wavelength calibration).
+    // Combine to a single value ONLY for graphing / recording (real R/G/B
+    // data stays intact in spectrumSmoothR/G/B for future analysis).
     combineForDisplay(spectrumSmoothR, spectrumSmoothG, spectrumSmoothB, spectrumCombined);
 
     // Find real (unclamped) max + its position
@@ -630,6 +840,7 @@ void loop() {
     webPeakPos = peakIdx;
     webMaxVal = maxVal;
     webFPS = fps;
+    lastSpectrumMs = millis();
 
     // Update LCD
     drawSpectrum(spectrumCombined);
@@ -644,5 +855,9 @@ void loop() {
     }
 
     drawInfo(spectrumCombined, maxVal, fps);
+    drawPredictButton(false);
+    if (popupUntil != 0 && millis() < popupUntil) {
+        drawPredictionPopup(popupValue, popupOk);
+    }
     gfx->flush();
 }

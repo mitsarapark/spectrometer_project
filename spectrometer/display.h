@@ -12,9 +12,22 @@
  *    - SPECTRUM_LEN, COL_AVG_RANGE, TEMPORAL_FRAMES, SMOOTH_WINDOW
  *    - DISPLAY_MAX_INTENSITY (display scale - NOT a data clamp; see
  *      spectrum_processing.h, raw data is never clamped)
- *  Also uses darkFrameCaptured + positionToRGB() from
- *  spectrum_processing.h (include that file first).
+ *    - MODEL_UNIT from model_weights.h (include that file first)
+ *  Also uses darkFrameCaptured + pixelToNm()/positionToRGB() from
+ *  spectrum_processing.h, and the prediction globals from inference.h
+ *  (declared below as extern, defined later in the same translation unit).
  * ============================================================== */
+
+extern bool hasPrediction;
+extern float lastPrediction;
+extern bool modelReady;
+
+// On-screen PREDICT button (touch). Drawn on top of the info area every
+// frame, so it must be re-drawn after drawInfo() clears that region.
+#define BTN_X        (DISP_WIDTH - 150)
+#define BTN_Y        434
+#define BTN_W        140
+#define BTN_H        34
 
 bool initDisplay() {
     Wire.begin(21, 22);
@@ -48,7 +61,7 @@ bool initDisplay() {
     return true;
 }
 
-// x axis = pixel position (0..SPECTRUM_LEN-1), NOT calibrated to nm.
+// x axis = wavelength (nm) from the 2-point calibration.
 // y axis = intensity, scaled 0..DISPLAY_MAX_INTENSITY (this is a
 // display-only scale - the underlying data is never clamped, see
 // spectrum_processing.h).
@@ -68,17 +81,17 @@ void drawAxes() {
         gfx->printf("%d", (int)val);
     }
 
-    // X axis: pixel position
+    // X axis: wavelength in nm
     for (int i = 0; i <= 8; i++) {
         int pos = i * (SPECTRUM_LEN - 1) / 8;
         int x = GRAPH_LEFT + (i * GRAPH_WIDTH) / 8;
         gfx->drawLine(x, GRAPH_BOTTOM, x, GRAPH_BOTTOM + 5, WHITE);
         gfx->drawLine(x, GRAPH_TOP, x, GRAPH_BOTTOM, DARKGREY);
         gfx->setCursor(x - 10, GRAPH_BOTTOM + 8);
-        gfx->printf("%d", pos);
+        gfx->printf("%d", (int)pixelToNm(pos));
     }
-    gfx->setCursor(GRAPH_LEFT + GRAPH_WIDTH / 2 - 40, GRAPH_BOTTOM + 20);
-    gfx->print("Position (px, not calibrated)");
+    gfx->setCursor(GRAPH_LEFT + GRAPH_WIDTH / 2 - 25, GRAPH_BOTTOM + 20);
+    gfx->print("Wavelength (nm)");
 }
 
 // spectrum[] holds REAL (unclamped) combined intensity values. Only the
@@ -165,7 +178,7 @@ void drawInfo(float *spectrum, float maxVal, float fps) {
     gfx->setTextSize(2);
     gfx->setTextColor(CYAN);
     gfx->setCursor(10, TEXT_Y);
-    gfx->printf("Peak: px %d", peakIdx);
+    gfx->printf("Peak: %.0f nm", pixelToNm(peakIdx));
 
     gfx->setTextSize(1);
     gfx->setTextColor(WHITE);
@@ -183,8 +196,61 @@ void drawInfo(float *spectrum, float maxVal, float fps) {
         gfx->print("Dark frame: ON");
     } else {
         gfx->setTextColor(RED);
-        gfx->print("Dark frame: OFF (press BOOT)");
+        gfx->print("Dark frame: OFF (hold BOOT)");
     }
+
+    gfx->setCursor(10, TEXT_Y + 70);
+    if (!modelReady) {
+        gfx->setTextColor(DARKGREY);
+        gfx->print("Model: not loaded");
+    } else if (hasPrediction) {
+        gfx->setTextColor(CYAN);
+        gfx->printf("Pred: %.2f %s", lastPrediction, MODEL_UNIT);
+    } else {
+        gfx->setTextColor(WHITE);
+        gfx->print("Model ready - press PREDICT");
+    }
+}
+
+// On-screen PREDICT button. Re-drawn after every drawInfo() because
+// drawInfo() clears the whole info area.
+void drawPredictButton(bool pressed) {
+    gfx->fillRect(BTN_X, BTN_Y, BTN_W, BTN_H, pressed ? BLUE : DARKBLUE);
+    gfx->drawRect(BTN_X, BTN_Y, BTN_W, BTN_H, CYAN);
+    gfx->setTextSize(2);
+    gfx->setTextColor(WHITE);
+    gfx->setCursor(BTN_X + 18, BTN_Y + 9);
+    gfx->print("PREDICT");
+    gfx->setTextSize(1);
+}
+
+bool pointInPredictButton(uint16_t x, uint16_t y) {
+    return (x >= BTN_X) && (x < BTN_X + BTN_W) &&
+           (y >= BTN_Y) && (y < BTN_Y + BTN_H);
+}
+
+// Transient result box shown for a few seconds after a prediction.
+void drawPredictionPopup(float value, bool ok) {
+    const int w = 250, h = 90;
+    const int x = (DISP_WIDTH - w) / 2;
+    const int y = 160;
+
+    gfx->fillRect(x, y, w, h, BLACK);
+    gfx->drawRect(x, y, w, h, ok ? GREEN : RED);
+    gfx->drawRect(x + 1, y + 1, w - 2, h - 2, ok ? GREEN : RED);
+
+    gfx->setTextSize(1);
+    gfx->setTextColor(ok ? GREEN : RED);
+    gfx->setCursor(x + 12, y + 10);
+    gfx->print(ok ? "Predicted concentration" : "Model not ready");
+
+    gfx->setTextSize(3);
+    gfx->setTextColor(WHITE);
+    gfx->setCursor(x + 12, y + 34);
+    if (ok) gfx->printf("%.2f %s", value, MODEL_UNIT);
+    else gfx->print("--");
+
+    gfx->setTextSize(1);
 }
 
 #endif // DISPLAY_H

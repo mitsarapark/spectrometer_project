@@ -1,2 +1,10 @@
+# Session transcripts (never commit these)
 session-*.md
 spectro.md
+
+# ML training artefacts
+ml/__pycache__/
+ml/*.pyc
+ml/*.png
+ml/dataset.csv
+ml/model_weights.h
