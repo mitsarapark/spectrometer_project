@@ -1,141 +1,316 @@
 # AGENTS.md
 
-คู่มือสำหรับ AI agent / ผู้พัฒนาที่กลับมาทำงานต่อในโปรเจกต์นี้ (อ่านก่อนแก้โค้ดทุกครั้ง)
+คู่มือสำหรับ AI agent / ผู้พัฒนาที่กลับมาทำงานต่อในโปรเจกต์นี้
+**อ่านไฟล์นี้ก่อนแก้โค้ดทุกครั้ง** — เนื้อหาด้านล่างคือสถานะจริงของโค้ด ณ commit ล่าสุด
+
+อัปเดตล่าสุด: 2026-11-11
+
+---
 
 ## 1. เป้าหมายโปรเจกต์
 
-สร้างเครื่อง spectrometer แบบพกพาบนบอร์ด **ESP32-S3-Touch-LCD-3.5B** (Waveshare)
-โดยใช้กล้อง onboard อ่านสเปกตรัมแสงที่ผ่าน grating แล้ว:
+เครื่อง spectrometer แบบพกพาบนบอร์ด **Waveshare ESP32-S3-Touch-LCD-3.5B**
+ใช้กล้อง onboard อ่านสเปกตรัมที่ผ่าน grating (กระจายแนวตั้ง) แล้ว:
 
-1. มีฟังก์ชัน **dark frame capture**
-2. ดึงสเปกตรัมจาก **คอลัมน์กลาง** ของภาพ (สเปกตรัมกระจายแนวตั้ง)
-3. วาดกราฟ intensity vs wavelength (nm) ลงจอ LCD ในตัวเครื่อง
-4. เปิด WiFi AP ให้เว็บเบราว์เซอร์ดู **ภาพจากกล้อง + กราฟ** พร้อมเส้น/แถบแนวตั้งบอกตำแหน่งที่วัด
-5. เก็บ dataset ลง flash ผ่านเว็บ เพื่อนำไปเทรน PLSR บน PC
-6. รันโมเดลบน ESP32 ทำนายความเข้มข้นของสารเมื่อกดปุ่มบนจอ
-7. เปิด captive portal + mDNS (`http://spectrometer.local`) ให้เข้าเว็บได้ง่าย
+1. dark frame capture
+2. อ่านสเปกตรัมจาก **แนวกลางของแถบแสง** (auto tilt/offset detection)
+3. วาดกราฟ intensity vs wavelength (nm) บน LCD
+4. WiFi AP + เว็บดูภาพกล้อง/กราฟ พร้อมเส้น/แถบแสดงแนวที่วัด
+5. เก็บ dataset CSV ลง flash ผ่านเว็บ → เทรน PLSR บน PC
+6. รันโมเดลบน ESP32 ทำนายความเข้มข้นเมื่อกดปุ่ม
+7. captive portal + mDNS ให้เข้าเว็บง่าย
 
-## 2. โครงสร้างไฟล์
+---
+
+## 2. สถานะปัจจุบัน (สรุปสั้น)
+
+**ทำงานได้แล้ว**
+- กล้อง RGB565 VGA + LCD + กราฟ + color bar + info
+- WiFi AP `ITIM-project` / `http://192.168.4.1` (port 80, ไม่ต้องใส่ port)
+- captive portal (เด้งหน้าเว็บเองหลังต่อ WiFi) + mDNS `http://spectrometer.local`
+- dark frame (BOOT ค้าง), temporal/moving average, Rec.709 combine
+- 2-point wavelength calibration (ค่า default 380–700 nm)
+- auto center-line: fit `x(y)=a*y+b` แบบ track แถบหลัก + overlay เอียงบนเว็บ
+- axis calibration (`/calibrate`, ปุ่มที่สามถ้าต่อ, serial `c`)
+- dataset CSV ลง LittleFS **หรือ** FFat (เลือกตาม partition อัตโนมัติ) + ดาวน์โหลด/ล้าง
+- PLSR training pipeline (`ml/`) + on-device dot-product inference
+- ปุ่ม PREDICT บนจอ (ถ้า touch ใช้ได้) + BOOT สำรอง
+
+**ยังค้าง / ต้องทำต่อ**
+- **Touch ยังไม่เจอ** (`0x3B: not found`) → ต้องสแกน I2C bus อีกที
+- **ปุ่มกายภาพ**: ผู้ใช้บอก BOOT ใช้ไม่ได้ และมีปุ่มอื่นทำ dark/predict อยู่ — ยังไม่ทราบ GPIO
+  (`DARKFRAME_BUTTON_PIN = 0`, `CAL_BUTTON_PIN = -1` ต้องแก้เมื่อรู้ GPIO)
+- **Wavelength calibration จริง** (405/546 nm จากหลอด fluorescent) ยังไม่ได้วัด
+- **โมเดลจริง** ยังเป็น placeholder (`MODEL_READY 0`)
+- Fe analysis / multi-peak analysis
+
+---
+
+## 3. โครงสร้างไฟล์
 
 ```
 spectrometer/                 <-- sketch หลัก (ชื่อโฟลเดอร์ต้องตรงกับ .ino)
-  spectrometer.ino            setup/loop, camera, WiFi/WebServer, HTML, pipeline orchestration
-  spectrum_processing.h       extraction, dark frame, averaging, combine, calibration
-  display.h                   วาดกราฟ/แกน/color bar/ข้อมูล/ปุ่ม PREDICT ลง LCD
-  dataset.h                   บันทึก CSV ลง LittleFS + นับ sample + clear
-  inference.h                 รัน PLS dot product บนเครื่อง
-  model_weights.h             โมเดลที่ generate จาก ml/ (placeholder = MODEL_READY 0)
-  touch.h                     อ่าน touch AXS15231B (fallback ไป BOOT ถ้าไม่เจอ)
+  spectrometer.ino            setup/loop, camera, WiFi/WebServer/HTML, ปุ่ม, pipeline
+  spectrum_processing.h       axis detection, extraction, dark frame, averaging,
+                              combine, calibration (pixelToNm), wavelengthToRGB
+  display.h                   วาดกราฟ/แกน/color bar/ข้อมูล/ปุ่ม PREDICT/ป็อปอัปผล
+  dataset.h                   CSV ลง LittleFS หรือ FFat + นับ sample + clear
+  inference.h                 PLS dot product บนเครื่อง
+  model_weights.h             โมเดลจาก ml/ (placeholder => MODEL_READY 0)
+  touch.h                     อ่าน touch AXS15231B @ 0x3B (fallback ไป BOOT)
 ml/                           เทรน PLSR บน PC
-  train_plsr.py               โหลด CSV -> augment -> CV -> export model_weights.h
-  augment.py                  เพิ่ม noise / baseline / gain drift
-  README.md                   ขั้นตอนเก็บข้อมูล + เทรน + flash
+  train_plsr.py               CSV -> augment -> CV เลือก n_components -> export header
+  augment.py                  noise / baseline / gain drift
+  README.md                   วิธีเก็บข้อมูล + เทรน + flash
 test/                         โค้ดทดสอบ display/camera (reference เท่านั้น)
-PROJECT_STATUS.md             สถานะงาน + roadmap
-README.md                     ภาพรวม + วิธี build/flash
+PROJECT_STATUS.md             สถานะ + ค่าคอนฟิก + roadmap
+problem.md                    บันทึกปัญหาที่เจอ/วิธีแก้ (P1-P8)
+README.md                     ภาพรวม + build/flash
 ```
 
-หมายเหตุ: โฟลเดอร์ `final/` ถูกลบแล้ว (ประวัติยังอยู่ใน git) เพื่อกันการสับสนว่าเป็นเวอร์ชันล่าสุด
+โฟลเดอร์ `final/` ถูกลบแล้ว (ประวัติอยู่ใน git)
 
-## 3. Hardware / Board settings
+---
+
+## 4. Hardware / Board settings
 
 - Board: **ESP32S3 Dev Module**
-- PSRAM: **OPI PSRAM** (จำเป็น เพราะ frame buffer RGB565 VGA + canvas)
-- Partition: **Huge APP (3MB No OTA/1MB SPIFFS)** หรือ **16M Flash (3MB APP/9.9MB FATFS)** — ทั้งสองแบบใช้ได้ (LittleFS หรือ FFat ตาม partition ที่พบ)
-- USB CDC On Boot: **Enabled** (ถ้าต้องการ Serial)
-- Libraries: `esp32-camera` (มากับ ESP32 core), `Arduino_GFX` (moononournation), `TCA9554`
+- PSRAM: **OPI PSRAM** (จำเป็น)
+- Partition: **Huge APP (3MB No OTA/1MB SPIFFS)** หรือ **16M Flash (3MB APP/9.9MB FATFS)**
+  (โค้ดเลือก LittleFS/FFat เอง; ผู้ใช้ใช้ FATFS อยู่)
+- USB CDC On Boot: **Enabled**
+- Libraries: `esp32-camera` (มากับ core), `Arduino_GFX`, `TCA9554`
 
-### Pin map ที่ใช้จริง (ห้ามเดา ใช้ค่านี้)
+### Pin map (ห้ามเดา)
 
-LCD QSPI: CS=12, CLK=5, D0=1, D1=2, D2=3, D3=4, BL=6
-Camera: XCLK=38, SIOD=8, SIOC=7, D7..D0 = 21,39,40,42,46,48,47,45,
-VSYNC=17, HREF=18, PCLK=41, PWDN=-1, RESET=-1
-I2C (TCA9554 + touch): SDA=21, SCL=22
-Touch controller: AXS15231B @ I2C `0x3B`
-BOOT button: GPIO0 (INPUT_PULLUP, active LOW)
+```
+LCD QSPI : CS=12, CLK=5, D0=1, D1=2, D2=3, D3=4, BL=6
+Camera   : XCLK=38, SIOD=8, SIOC=7, D7..D0=21,39,40,42,46,48,47,45,
+           VSYNC=17, HREF=18, PCLK=41, PWDN=-1, RESET=-1
+I2C      : SDA=21, SCL=22 (TCA9554 @0x20, touch @0x3B)
+BOOT     : GPIO0 (INPUT_PULLUP, active LOW)
+```
 
-## 4. Data flow
+> หมายเหตุ: pin map นี้มาจากโค้ดที่ใช้งานได้จริง แต่ GPIO21 ซ้ำกับ camera D7
+> ถ้า touch ยังไม่เจอ ให้สงสัย bus นี้ก่อน (ลองสแกน 8/7)
+
+---
+
+## 5. Data flow
 
 ```
 esp_camera_fb_get() [RGB565 VGA 640x480]
-  -> updateSpectrumAxis()     fit x(y)=a*y+b ต่อแนวสเปกตรัม (auto tilt/offset)
-  -> extractSpectrum()        อ่านตามแนวที่ fit แล้ว ± COL_AVG_RANGE, per row -> R/G/B
+  -> updateSpectrumAxis(fb)   track แถบสเปกตรัม + fit x(y)=a*y+b (EMA)
+  -> extractSpectrum(fb)      อ่านตามแนว x(y) ± COL_AVG_RANGE -> R/G/B ต่อ row
   -> applyDarkFrameSubtraction()
-  -> applyTemporalAverage()   TEMPORAL_FRAMES frames
-  -> applyMovingAverage()     SMOOTH_WINDOW
-  -> combineForDisplay()      Rec.709 luma (0.2126R + 0.7152G + 0.0722B)
-  -> drawSpectrum()/drawColorBar()/drawInfo()/drawPredictButton() -> gfx->flush()
-  -> /data JSON (80 จุด + nm + model/sample metadata) + /capture JPEG
-  -> /record?conc=.. (LittleFS CSV) -> /dataset.csv -> ml/train_plsr.py
+  -> applyTemporalAverage()   4 เฟรม
+  -> applyMovingAverage()     window 7
+  -> combineForDisplay()      Rec.709 luma
+  -> LCD: drawSpectrum/drawColorBar/drawInfo/drawPredictButton -> gfx->flush()
+  -> Web: /data (JSON 80 จุด + nm + axis + model) + /capture (JPEG)
+  -> /record?conc=.. -> dataset.h -> /dataset.csv
   -> predictConcentration(): dot product บน spectrumCombined
 ```
 
-สำคัญ:
-- **ห้าม clamp ค่าข้อมูลจริง** ที่ 255; clamp เฉพาะตอน map เป็นพิกัด pixel บนจอ
-- ค่า RGB ถูกเก็บแยก channel ตลอด pipeline; `combineForDisplay()` ใช้เฉพาะกราฟ/CSV/โมเดล
-- แกน X เป็น nm จาก 2-point calibration (ค่าเริ่มต้นเป็น placeholder)
-- `SPECTRUM_INVERT` กลับลำดับ row ถ้าภาพสเปกตรัมกลับหัว
-- `CSV_POINTS` ต้องเท่ากับ `MODEL_INPUT_DIM` (มี `#error` ตรวจให้แล้ว)
+กฎสำคัญ:
+- **ห้าม clamp ข้อมูลจริง** ที่ 255; clamp เฉพาะตอนแปลงเป็นพิกัด pixel
+- RGB แยก channel ตลอด; combine เฉพาะกราฟ/CSV/โมเดล
+- `CSV_POINTS` ต้องเท่ากับ `MODEL_INPUT_DIM` (มี `#error` กันไว้)
+- การ resample ต้องใช้ grid เดียวกันทั้ง `dataset.h` และ `inference.h`
+  (`i * (SPECTRUM_LEN - 1) / (N - 1)`)
 
-## 5. การ build / flash
+---
 
-เครื่อง develop อาจไม่มี `arduino-cli` หรือ `pio` ติดตั้ง (ตรวจก่อนใช้)
-ถ้าไม่มี ให้ผู้ใช้ compile/flash ผ่าน Arduino IDE เอง:
+## 6. ค่าคอนฟิกหลัก (`spectrometer/spectrometer.ino`)
 
-1. เปิด `spectrometer/spectrometer.ino`
-2. เลือก board ตามข้อ 3
-3. Verify/Upload
-4. ต่อ WiFi `ITIM-project` (password `itimsarapark`) แล้วเปิด `http://192.168.4.1`
+| Macro | ค่า | ความหมาย |
+|---|---|---|
+| `CENTER_COL` | 320 | fallback เมื่อยัง detect แนวไม่ได้ |
+| `COL_AVG_RANGE` | 10 | เฉลี่ย ±10 คอลัมน์รอบแนว |
+| `SPECTRUM_LEN` | 480 | = FRAME_HEIGHT |
+| `SPECTRUM_INVERT` | 0 | 1 = กลับลำดับ row |
+| `TEMPORAL_FRAMES` | 4 | จำนวนเฟรมเฉลี่ย |
+| `SMOOTH_WINDOW` | 7 | moving average |
+| `FRAME_INTERVAL_MS` | 300 | คาบอัปเดต |
+| `COMBINE_MODE` | `COMBINE_REC709` | Rec.709 / Rec.601 / average |
+| `CAL_PIXEL_1/2` | 0 / 479 | default เต็มคอลัมน์ |
+| `CAL_NM_1/2` | 380 / 700 | ช่วง visible (default) |
+| `SPEC_NM_MIN/MAX` | 380 / 700 | clamp ผล `pixelToNm()` |
+| `MANUAL_EXPOSURE` | 300 | tune กับแสงจริง |
+| `MANUAL_GAIN` | 0 | tune กับแสงจริง |
+| `DISPLAY_MAX_INTENSITY` | 300 | สเกลจอ (ไม่ clamp ข้อมูล) |
+| `DARKFRAME_BUTTON_PIN` | 0 | ปุ่ม action (สั้น=predict, ค้าง=dark) |
+| `DARKFRAME_HOLD_MS` | 1500 | เวลากดค้าง |
+| `CAL_BUTTON_PIN` | -1 | ปุ่มที่สาม (axis calibrate) — ยังไม่ต่อ |
+| `TOUCH_ENABLE` | 1 | เปิด/ปิด touch |
+| `TOUCH_I2C_ADDR` | 0x3B | AXS15231B touch |
+| `TOUCH_POLL_MS` | 60 | คาบ poll touch |
 
-## 6. การใช้งานปุ่ม
+Axis detection (`spectrum_processing.h`):
 
-| การกระทำ | ผล |
+| Macro | ค่า | ความหมาย |
+|---|---|---|
+| `AXIS_AUTO_DETECT` | 1 | เปิด auto center-line |
+| `AXIS_ROW_STEP` | 4 | track ทุก 4 แถว |
+| `AXIS_MIN_ROWS` | 40 | จำนวนจุดขั้นต่ำที่เชื่อถือ |
+| `AXIS_MAX_SLOPE` | 0.30 | |a| สูงสุด (px/row) |
+| `AXIS_EMA_ALPHA` | 0.25 | ความลื่นระหว่างเฟรม |
+| `AXIS_MIN_BRIGHT` | 12 | กัน noise ในเฟรมมืด |
+| `AXIS_TRACK_WIN` | 30 | หน้าต่างค้นหา ±px รอบแถวก่อนหน้า |
+| `AXIS_REFINE_WIN` | 8 | หน้าต่าง centroid รอบ peak |
+| `AXIS_PEAK_FRACTION` | 0.5 | row peak ต้อง ≥ ครึ่งของ frame peak |
+
+---
+
+## 7. Web UI / Endpoints
+
+| Path | งาน |
 |---|---|
-| แตะปุ่ม **PREDICT** บนจอ | ทำนายความเข้มข้น (ถ้า `MODEL_READY 1`) |
-| กด BOOT สั้น (< 1.5 s) | ทำนายความเข้มข้น (สำรองเมื่อ touch ใช้ไม่ได้) |
-| กด BOOT ค้าง (>= 1.5 s) | จับ dark frame |
-| ปุ่มที่สาม (`CAL_BUTTON_PIN`, default `-1`) | Axis calibration (ปรับความเอียง/offset) |
-| `http://192.168.4.1/calibrate` | Axis calibration ผ่านเว็บ (ไม่ต้องมีปุ่ม) |
-| `http://192.168.4.1/axis` | ดูค่า `a`, `b`, `detected` |
-| Serial command `c` / `d` / `p` | axis calibrate / dark frame / predict |
+| `/` | หน้าเว็บ (กราฟ + ภาพกล้อง + overlay + Dataset panel) |
+| `/data` | JSON: `peak`, `peakNm`, `max`, `scale`, `nmStart/End`, `axisA/B/On`, `col`, `colRange`, `modelReady`, `hasPred`, `pred`, `modelUnit`, `samples`, `fps`, `spectrum[80]` |
+| `/capture` | JPEG snapshot |
+| `/record?conc=<value>` | บันทึกแถว CSV (ปฏิเสธถ้าสเปกตรัมเก่า > 3 s) |
+| `/dataset.csv` | ดาวน์โหลด CSV |
+| `/dataset/clear` | ล้าง dataset |
+| `/calibrate` | เก็บ 20 เฟรม → median `a`,`b` แล้วล็อกแนว |
+| `/axis` | `{"a":..,"b":..,"detected":..}` |
+| `/ping` | `pong` (ทดสอบเร็ว) |
 
-## 7. ML workflow (สรุป)
+อื่น ๆ: captive portal redirect ทุก path ที่ไม่รู้จัก, `[443]` probe log เมื่อ browser ใช้ HTTPS
 
-1. วัด sample ที่ทราบความเข้มข้น → หน้าเว็บกรอกค่า → **Record sample**
-2. ทำซ้ำหลายความเข้มข้น (แนะนำ >= 20 samples)
-3. **Download CSV** → `ml/train_plsr.py --csv dataset.csv --unit "<หน่วย>"`
-4. คัดลอก `model_weights.h` ที่ได้ไปทับใน `spectrometer/`
-5. Rebuild + flash → ปุ่ม PREDICT ใช้งานได้
+---
 
-รายละเอียดอยู่ใน `ml/README.md` และ `PROJECT_STATUS.md`
+## 8. ปุ่ม / input
 
-## 8. กติกาการทำงาน (สำคัญ)
+| อินพุต | ผล |
+|---|---|
+| BOOT สั้น (<1.5 s) | predict |
+| BOOT ค้าง (>=1.5 s) | dark frame |
+| `CAL_BUTTON_PIN` (ถ้าตั้ง) | axis calibration |
+| Touch ปุ่ม PREDICT บนจอ | predict (ถ้า touch เจอ) |
+| Serial `c` | axis calibration |
+| Serial `d` | dark frame |
+| Serial `p` | predict |
 
-- **ทุกครั้งที่มีการแก้ไขไฟล์ ให้ commit ด้วย git ทันที** หลังแก้น้อยๆ เสร็จและตรวจแล้ว
-- ก่อน commit: `git status`, `git diff`, ตรวจว่าไม่มี secret
-- ข้อความ commit สั้น ตรงงาน ใช้ prefix `feat:`, `fix:`, `refactor:`, `docs:`, `chore:`
-- ห้าม commit/push ขึ้น remote เอง เว้นแต่ผู้ใช้สั่ง
-- หลีกเลี่ยง comment ที่ไม่จำเป็น; โค้ดมี comment อธิบายส่วนสำคัญอยู่แล้ว
-- ถ้าไม่แน่ใจเรื่อง hardware/tuning ให้ถามผู้ใช้ก่อนเดา
+**ต้องแก้เมื่อรู้ GPIO**: `DARKFRAME_BUTTON_PIN`, `CAL_BUTTON_PIN`
 
-## 9. Known issues / gotchas
+---
 
-- **ค่า calibration เริ่มต้น** map ทั้งคอลัมน์เป็น 380–700 nm (row 0 = 380 nm, row 479 = 700 nm) ผ่าน `CAL_*`; เมื่อวัดหลอด fluorescent จริงแล้วให้แก้เป็น row ของ peak 405/546 nm
-- `SPEC_NM_MIN/MAX` (380/700) ใช้ clamp ผลของ `pixelToNm()` ไม่ให้หลุดช่วงที่วัด
-- **Touch ยังไม่ยืนยันบนฮาร์ดแวร์จริง**: โค้ดสแกน `0x3B` บน Wire (SDA=21/SCL=22) ถ้าไม่เจอจะ fallback ไป BOOT อัตโนมัติ; ถ้าใช้ไม่ได้ให้ลองสแกน bus 8/7
-- `/capture` เรียก `esp_camera_fb_get()` แยกจาก loop ทำให้บางรอบ frame ถูกใช้ไป
-- Frame rate จริงจำกัดด้วย canvas flush + JPEG conversion; `FRAME_INTERVAL_MS` = 300 ms
-- `MANUAL_EXPOSURE` / `MANUAL_GAIN` ต้อง tune ตามแหล่งแสงจริง (default 300 / 0)
-- `/record` จะปฏิเสธถ้าข้อมูลสเปกตรัมเก่าเกิน 3 วินาที
-- **Stack**: ห้ามประกาศ array ขนาดใหญ่ (~2 KB ขึ้นไป เช่น `[SPECTRUM_LEN]`) บน stack ของ loop task — เคยทำให้เกิด `Stack canary watchpoint triggered (loopTask)`; ใช้ `static` แทน (ดู `problem.md` P8)
-- เปลี่ยน exposure/gain/calibration/COMBINE_MODE แล้ว **ต้องเก็บ dataset ใหม่และเทรนใหม่**
-- ยังไม่มี wavelength calibration อัตโนมัติ และยังไม่มี Fe analysis
+## 9. ML workflow
 
-## 10. ขั้นตอนตรวจงานก่อนส่ง
+1. วัด sample ที่รู้ความเข้มข้น → เว็บกรอกค่า → **Record sample**
+2. ทำหลายความเข้มข้น (แนะนำ ≥20 samples)
+3. **Download CSV**
+4. ```bash
+   cd ml
+   python -m pip install -r requirements.txt
+   python train_plsr.py --csv dataset.csv --unit "<หน่วย>"
+   ```
+5. คัดลอก `ml/model_weights.h` (ค่า default path คือ `spectrometer/model_weights.h`) ทับ แล้ว flash ใหม่
+6. `MODEL_READY` จะเป็น 1 → PREDICT ใช้งานได้
 
-1. ตรวจ `SPECTRUM_LEN`, ขนาด buffer, index bounds ให้ตรงกัน (ปัจจุบัน = FRAME_HEIGHT = 480)
-2. ตรวจว่าไม่มี identifier เก่า (`CENTER_ROW`, `ROW_AVG_RANGE`) หลงเหลือ
-3. ถ้าแก้ HTML/JS ให้ตรวจว่า `handleData()` ส่ง field ที่ JS ใช้ครบ
-   (`peakNm`, `nmStart`, `nmEnd`, `modelReady`, `hasPred`, `pred`, `modelUnit`, `samples`)
-4. ถ้าแก้ `model_weights.h` ให้ตรวจ `MODEL_INPUT_DIM` == `CSV_POINTS` == จำนวนคอลัมน์ CSV
-5. อัปเดต `PROJECT_STATUS.md` เมื่อเพิ่ม/ลดฟีเจอร์
+ข้อบังคับ: เปลี่ยน exposure/gain/calibration/COMBINE_MODE/CSV_POINTS → **เก็บ dataset ใหม่และเทรนใหม่**
+
+---
+
+## 10. การ build / flash
+
+เครื่อง develop ปกติ**ไม่มี** `arduino-cli` หรือ `pio` (ตรวจก่อนใช้)
+
+1. เปิด `spectrometer/spectrometer.ino` ใน Arduino IDE
+2. Board: ESP32S3 Dev Module / OPI PSRAM / partition ตามข้อ 4 / USB CDC On Boot = Enabled
+3. Verify / Upload
+4. ต่อ WiFi `ITIM-project` (`itimsarapark`) → หน้าเว็บเด้งเอง หรือ `http://192.168.4.1`
+5. กด BOOT ค้างเพื่อ dark frame (ปิดช่องรับแสง)
+
+---
+
+## 11. Debug quick reference
+
+Log ที่ควรเห็นตอนบูต:
+```
+WiFi AP started: ITIM-project
+IP address: 192.168.4.1
+Captive portal DNS started
+mDNS: http://spectrometer.local
+Web server started on port 80
+Open: http://192.168.4.1/   (no port needed, HTTP/80)
+FAT partition 'ffat' at 0x...... , xxxx KB
+Dataset ready: N samples in /dataset.csv
+Touch 0x3B: not found (use BOOT button)
+Setup complete. Starting capture...
+Serial commands: c=axis calibrate, d=dark frame, p=predict
+[hb] up=..s stations=.. heap=..
+```
+
+อาการ → ตรวจ:
+| อาการ | ตรวจ |
+|---|---|
+| เปิดเว็บไม่ได้ | `[ap] client connected` มีไหม, `GET /` มีไหม, `[443]` ขึ้นไหม (browser ใช้ https) |
+| บอร์ดรีบูต | `Stack canary` / panic → ดู P8 ใน `problem.md` |
+| เส้นเหลืองไม่ทับแถบ | `/axis` (`detected`), ปรับ `AXIS_PEAK_FRACTION` / `AXIS_TRACK_WIN` |
+| dataset ไม่ขึ้น | log partition backend (LittleFS/FFat) |
+| ค่า intensity ต่ำ | ตรวจ `a`,`b` ว่าตรงแนว, tune exposure |
+
+เครื่องมือทดสอบ offline (ไม่ต้องมี ESP32): compile `spectrum_processing.h` ด้วย g++ + stub
+แล้วสร้างเฟรมสังเคราะห์เรียก `fitSpectrumAxis()` — ใช้ตรวจ regression ของ algorithm ได้
+
+---
+
+## 12. Known issues / gotchas
+
+- **Touch ยังไม่เจอ** บนบอร์ดจริง → fallback BOOT; ต้องลองสแกน bus 8/7 หรือ address อื่น
+- **ปุ่มจริงยังไม่ผูก**: BOOT อาจเสีย, ต้องตั้ง `DARKFRAME_BUTTON_PIN`/`CAL_BUTTON_PIN` ให้ตรง
+- **Stack**: ห้าม array ใหญ่ (~2 KB+) บน stack ของ loop task; ใช้ `static` (เคย crash canary)
+- ค่า calibration เป็น 380–700 แบบ uncalibrated; ต้องวัดหลอด fluorescent จริง
+- `/capture` แย่ง frame กับ loop (ยอมรับได้)
+- `MANUAL_EXPOSURE` / `MANUAL_GAIN` ยังไม่ tune
+- ยังไม่ init PMU (AXP2101) — บาง revision อาจต้องทำก่อนใช้กล้อง
+- หน้าเว็บ `https://` ใช้ไม่ได้ (มีแต่ HTTP 80) — ถ้า browser บังคับ https จะเห็น `[443]` ใน log
+- `test/` เป็น reference เก่า ห้ามใช้ build หลัก
+
+---
+
+## 13. กติกาการทำงาน
+
+- **ทุกครั้งที่แก้ไฟล์ ให้ commit ทันที** หลังตรวจแล้ว
+- ก่อน commit: `git status`, `git diff`, เช็กไม่มี secret
+- commit message สั้น ตรงงาน prefix: `feat:`, `fix:`, `refactor:`, `docs:`, `chore:`
+- **ห้าม push ขึ้น remote เอง** เว้นแต่ผู้ใช้สั่ง
+- ไม่ใส่ comment ที่ไม่จำเป็น; โค้ดมี comment เฉพาะส่วนสำคัญ
+- ไม่แน่ใจ hardware/tuning → ถามผู้ใช้ก่อนเดา
+
+---
+
+## 14. Checklist ก่อนส่งงาน
+
+1. `SPECTRUM_LEN` / buffer / index bounds ตรงกัน (480)
+2. ไม่มี identifier เก่า (`CENTER_ROW`, `ROW_AVG_RANGE`, `AXIS_COL_STEP`)
+3. แก้ HTML/JS → `handleData()` ส่ง field ครบตามที่ JS ใช้
+4. แก้ `model_weights.h` → `MODEL_INPUT_DIM` == `CSV_POINTS` == จำนวนคอลัมน์ CSV
+5. อัปเดต `PROJECT_STATUS.md` และ (ถ้ามีปัญหาใหม่) `problem.md`
+6. Compile ผ่าน syntax check ด้วย stub (ถ้าทำได้) + JS `node --check`
+
+---
+
+## 15. ประวัติสำคัญ (commit map)
+
+| Commit | สิ่งที่ทำ |
+|---|---|
+| `49853b1` | snapshot ก่อน refactor |
+| `d31acaa` | ย้าย `files (4)/` → `spectrometer/` |
+| `edbe048` | อ่านคอลัมน์กลาง + overlay แนวตั้ง + 300 ms |
+| `71fb27a` | AGENTS/PROJECT_STATUS/README |
+| `cc7365d` | ลบ `final/` |
+| `a9de3f2` | Rec.709, 2-point calibration, dataset, inference |
+| `616af03` | docs ML |
+| `e95a534` | จำกัดขนาด dataset |
+| `1f3b7ba` | map 380–700 nm + clamp |
+| `a26213b` | diagnostics `/ping`, AP event, TLS probe |
+| `b3be4d2` | FFat + captive portal + mDNS |
+| `3604d8b` | เริ่ม web server ก่อน splash |
+| `af1a461` | ย้าย buffer ใหญ่ off-stack (แก้ canary) |
+| `b81443c` | auto axis (tilt/offset) + calibrate |
+| `a526655` | serial commands c/d/p |
+| `9687e08` | แก้ scope bug ของ axis fit |
+| `3d13bab` | เปลี่ยนเป็น track แถบหลัก (กันแสงหักเหข้าง ๆ) |

@@ -1,6 +1,6 @@
 # PROJECT STATUS — ESP32-S3 Spectrometer
 
-อัปเดตล่าสุด: 2026-11-10
+อัปเดตล่าสุด: 2026-11-11
 
 ## 1. ภาพรวม
 
@@ -15,7 +15,8 @@
 ```
 Camera (RGB565 VGA 640x480)
    │
-   ├─ extractSpectrum()              center column ± COL_AVG_RANGE → R/G/B ต่อ row
+   ├─ updateSpectrumAxis()           track แถบหลัก + fit x(y)=a*y+b (EMA + MAD rejection)
+   ├─ extractSpectrum()              อ่านตามแนว x(y) ± COL_AVG_RANGE → R/G/B ต่อ row
    ├─ applyDarkFrameSubtraction()    ลบ baseline (ถ้าจับ dark frame แล้ว)
    ├─ applyTemporalAverage()         เฉลี่ย 4 เฟรมล่าสุด
    ├─ applyMovingAverage()           smooth window 7
@@ -51,6 +52,8 @@ Camera (RGB565 VGA 640x480)
 - [x] Auto center-line: fit `x(y)=a*y+b` ตามแนวสเปกตรัม (แก้ tilt/offset) + overlay เอียงตามจริงบนเว็บ
 - [x] Axis calibration (ปุ่มที่สามหรือ `/calibrate`) สำหรับล็อกแนว/ความเอียง
 - [x] Captive portal + mDNS (`http://spectrometer.local`) เข้าเว็บได้ทันทีหลังต่อ WiFi
+- [x] Serial commands: `c` (axis calibrate), `d` (dark frame), `p` (predict)
+- [x] แยกแสงหักเหข้างแถบหลักออกด้วย tracking window (±`AXIS_TRACK_WIN`)
 - [x] `SPECTRUM_INVERT` สำหรับกลับลำดับ row
 - [x] รีเฟรชทุก 300 ms (`FRAME_INTERVAL_MS`)
 
@@ -62,6 +65,10 @@ Camera (RGB565 VGA 640x480)
 | `AXIS_AUTO_DETECT` | 1 | เปิด auto tilt/offset detection |
 | `AXIS_MAX_SLOPE` | 0.30 | จำกัดความเอียงสูงสุด (px/row) |
 | `AXIS_EMA_ALPHA` | 0.25 | ความลื่นของเส้นแนวสเปกตรัม |
+| `AXIS_TRACK_WIN` | 30 px | หน้าต่าง track รอบแถวก่อนหน้า |
+| `AXIS_REFINE_WIN` | 8 px | หน้าต่าง centroid รอบ peak |
+| `AXIS_PEAK_FRACTION` | 0.5 | row peak ต้อง ≥ ครึ่งของ frame peak |
+| `DARKFRAME_BUTTON_PIN` | 0 | ปุ่ม action (สั้น=predict, ค้าง=dark) |
 | `CAL_BUTTON_PIN` | -1 | ปุ่มที่สามสำหรับ axis calibration (ตั้ง GPIO เมื่อต่อปุ่ม) |
 | `COL_AVG_RANGE` | 10 | เฉลี่ย ±10 คอลัมน์ |
 | `SPECTRUM_LEN` | 480 | = FRAME_HEIGHT |
@@ -114,6 +121,8 @@ python train_plsr.py --csv dataset.csv --unit "%"
 
 - ค่า calibration เริ่มต้น map เต็มคอลัมน์เป็น 380–700 nm — ควรวัด 405/546 nm จากหลอด fluorescent จริงแล้วแก้ `CAL_*`
 - Touch (`0x3B`) ยังไม่ยืนยันบนฮาร์ดแวร์; ถ้าไม่เจอจะ fallback ไป BOOT
+- **ปุ่มกายภาพยังไม่ผูกครบ**: `DARKFRAME_BUTTON_PIN = 0` (BOOT) และ `CAL_BUTTON_PIN = -1`; ต้องตั้งเมื่อรู้ GPIO จริง
+- ใช้ `/calibrate` หรือ serial `c` แทนปุ่ม calibrate ได้
 - `/capture` ดึงเฟรมใหม่แยกจาก loop → บางรอบ measurement frame ถูกใช้ไป
 - อัตราเฟรมจำกัดจาก canvas flush + JPEG conversion
 - ยังไม่ init PMU (AXP2101); บาง revision อาจต้องทำก่อนใช้กล้อง
@@ -143,4 +152,7 @@ python train_plsr.py --csv dataset.csv --unit "%"
 - ลดคาบอัปเดต 1000 ms → 300 ms
 - เปลี่ยนการรวมสีเป็น Rec.709 luma
 - เพิ่ม 2-point calibration, dataset LittleFS, PLSR pipeline และ on-device inference
+- เพิ่ม FFat backend, captive portal, mDNS, serial commands
+- เพิ่ม auto center-line (track แถบหลัก + linear fit) และ axis calibration
+- แก้ stack overflow (canary) ด้วยการย้าย buffer ใหญ่เป็น static
 - ลบ `final/` (เก็บประวัติใน git)

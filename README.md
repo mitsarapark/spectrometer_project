@@ -30,11 +30,12 @@ test/                    โค้ดทดสอบ (reference เท่าน�
 ## ฟีเจอร์
 
 - Dark frame capture (กด BOOT ค้าง >= 1.5 s)
-- อ่านสเปกตรัมแนวตั้งจากคอลัมน์กลาง ± ช่วงเฉลี่ย
+- อ่านสเปกตรัมแนวตั้งตาม **แนวกลางที่ตรวจจับอัตโนมัติ** `x(y)=a*y+b` (แก้ tilt/offset)
 - Temporal averaging + moving average, เก็บ R/G/B แยก channel, รวมด้วย Rec.709
 - 2-point wavelength calibration (ค่าเริ่มต้นเป็น placeholder)
 - กราฟ + color bar + peak (nm)/max/FPS บน LCD
-- WiFi AP + หน้าเว็บแสดงกราฟและภาพกล้อง พร้อมเส้น/แถบแนวตั้งบอกตำแหน่งที่วัด
+- WiFi AP + หน้าเว็บแสดงกราฟและภาพกล้อง พร้อมเส้น/แถบเอียงตามแนวจริง
+- Axis calibration ผ่าน `/calibrate`, serial `c` หรือปุ่มที่สาม (ถ้าต่อ)
 - เก็บ dataset CSV ลง flash (LittleFS หรือ FFat) ผ่านเว็บ แล้วดาวน์โหลดไปเทรน
 - On-device PLSR inference: แตะปุ่ม PREDICT บนจอ (หรือกด BOOT สั้น)
 - Captive portal + mDNS: ต่อ WiFi แล้วหน้าเว็บเด้งเอง หรือใช้ `http://spectrometer.local`
