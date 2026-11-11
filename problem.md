@@ -68,24 +68,34 @@ Partition scheme ที่ใช้คือ **16M Flash (3MB APP/9.9MB FATFS)**
 
 ---
 
-## P3 — `Touch 0x3B: not found`  `OPEN`
+## P3 — `Touch 0x3B: not found`  `FIXED (รอทดสอบบนเครื่อง)`
 
 **อาการ**
 ```
 Touch 0x3B: not found (use BOOT button)
 ```
 
-**สาเหตุที่เป็นไปได้**
-- touch controller ไม่ได้อยู่บน I2C bus เดียวกับ TCA9554 (SDA=21/SCL=22) อาจอยู่ที่ bus ของกล้อง (8/7)
-- address ไม่ใช่ `0x3B` บนบอร์ด revision นี้
-- bus มี conflict กับ camera data pin GPIO21 (pin map ที่ใช้อ้างอิงมี 21 เป็น D7)
+**สาเหตุจริง (ยืนยันจากตัวอย่าง Waveshare ที่ใช้ได้ 100%)**
+- touch/TCA9554 อยู่บน I2C **SDA=8, SCL=7** ไม่ใช่ 21/22
+- GPIO21 ที่โค้ดเดิมใช้เป็น SDA คือ **camera D7** → คำสั่ง I2C ไปชน data bus ของกล้อง
+- ต้องใช้ BSP driver (`esp_lcd_touch_axs15231b.h`: `bsp_touch_init/read/get_coordinates`) ไม่ใช่ raw register 6 ไบต์
 
-**ผลกระทบ**
-ปุ่ม PREDICT บนจอไม่ทำงาน แต่ยังใช้ **BOOT กดสั้น** แทนได้ (dark frame = กดค้าง)
+**วิธีแก้**
+- `initDisplay()` เปลี่ยนเป็น `Wire.begin(8, 7)`
+- `initTouch()` หลัง `esp_camera_init()`: `Wire.end()` + `Wire.begin(8, 7)` + `TCA.begin()` แล้ว
+  `bsp_touch_init(&Wire, -1, 0, 320, 480)`; อ่านด้วย `bsp_touch_read()` + `bsp_touch_get_coordinates()`
+- กล้องกับ touch แชร์ pad 8/7 จึงต้องเริ่ม Wire ใหม่หลังกล้อง init (กล้องไม่แตะ I2C อีกหลัง init)
 
-**สิ่งที่ต้องทำต่อ**
-- สแกน I2C ทั้งสอง bus (21/22 และ 8/7) เพื่อหา `0x3B`
-- ถ้าอยู่ที่ 8/7 ต้องแยก Wire instance หรือย้ายไปใช้ bus นั้นก่อน `initTouch()`
+---
+
+## P3.1 — Axis calibration ถูก auto-track ดึงกลับ  `FIXED`
+
+**อาการ**: กด `/calibrate` หรือ serial `c` แล้วค่า `a`,`b` เปลี่ยนกลับภายในไม่กี่เฟรม
+
+**สาเหตุ**: `updateSpectrumAxis()` ทำงานทุกเฟรมและ EMA กลับไปหา fit ของตัวเอง ค่าที่ calibrate จึงถูกแทนที่
+
+**วิธีแก้**: เพิ่ม `axisLocked` — calibration ที่สำเร็จจะ lock แนวและหยุด `updateSpectrumAxis()`
+ปลดได้ด้วย serial `a` หรือ `/axis/auto` (ไม่เก็บลง NVS; reboot = กลับไป auto)
 
 ---
 

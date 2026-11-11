@@ -74,6 +74,12 @@ Arduino_Canvas *gfx = new Arduino_Canvas(320, 480, g, 0, 0, ROTATION);
 #define HREF_GPIO_NUM     18
 #define PCLK_GPIO_NUM     41
 
+// I2C for the TCA9554 IO expander and the AXS15231B touch panel.
+// On this board both sit on 8/7 - the same pads as the camera SCCB, NOT
+// on 21/22 (21 is camera D7, so the touch IC never answered there).
+#define I2C_SDA_GPIO       8
+#define I2C_SCL_GPIO       7
+
 // ============================================================
 // SPECTROMETER SETTINGS
 // ============================================================
@@ -591,6 +597,8 @@ void handleData() {
     json += String(specIntercept, 2);
     json += ",\"axisOn\":";
     json += axisDetected ? "true" : "false";
+    json += ",\"axisLocked\":";
+    json += axisLocked ? "true" : "false";
     json += ",\"col\":";
     json += String(CENTER_COL);
     json += ",\"colRange\":";
@@ -695,11 +703,15 @@ void handleDatasetClear() {
 }
 
 // ---------------- Axis calibration / status endpoints ----------------
-void runAxisCalibration(); // defined with the button handlers below
+bool runAxisCalibration(); // defined with the button handlers below
 
 void handleCalibrate() {
-    runAxisCalibration();
-    String out = "{\"ok\":true,\"a\":";
+    bool ok = runAxisCalibration();
+    String out = "{\"ok\":";
+    out += ok ? "true" : "false";
+    out += ",\"locked\":";
+    out += axisLocked ? "true" : "false";
+    out += ",\"a\":";
     out += String(specSlope, 5);
     out += ",\"b\":";
     out += String(specIntercept, 2);
@@ -714,8 +726,17 @@ void handleAxis() {
     out += String(specIntercept, 2);
     out += ",\"detected\":";
     out += axisDetected ? "true" : "false";
+    out += ",\"locked\":";
+    out += axisLocked ? "true" : "false";
     out += "}";
     server.send(200, "application/json", out);
+}
+
+// Drop the manual lock and let the per-frame tracker take over again.
+void handleAxisAuto() {
+    axisLocked = false;
+    Serial.println("Axis lock released (web) - auto tracking");
+    server.send(200, "application/json", "{\"ok\":true,\"locked\":false}");
 }
 
 // ============================================================
@@ -792,6 +813,7 @@ void setup() {
     server.on("/dataset/clear", HTTP_GET, handleDatasetClear);
     server.on("/calibrate", HTTP_GET, handleCalibrate);
     server.on("/axis", HTTP_GET, handleAxis);
+    server.on("/axis/auto", HTTP_GET, handleAxisAuto);
     server.on("/ping", HTTP_GET, []() {
         server.send(200, "text/plain", "pong");
     });
@@ -840,7 +862,7 @@ void setup() {
     gfx->flush();
 
     Serial.println("Setup complete. Starting capture...");
-    Serial.println("Serial commands: c=axis calibrate, d=dark frame, p=predict");
+    Serial.println("Serial commands: c=axis calibrate (locks), d=dark frame, p=predict, a=resume auto axis");
 }
 
 // ============================================================
@@ -874,9 +896,10 @@ static void sortFloats(float *v, int n) {
 
 // Axis (tilt/offset) calibration: average the fitted center line over a
 // short burst and lock it in. Point the spectrometer at a known, steady
-// light source before running this. The wavelength calibration with
-// reference peaks will be added on top of this later.
-void runAxisCalibration() {
+// light source before running this. While locked, updateSpectrumAxis()
+// stops tracking so the line only changes on the next calibration
+// (serial 'a' or /axis/auto releases the lock).
+bool runAxisCalibration() {
     gfx->fillScreen(BLACK);
     gfx->setTextSize(1);
     gfx->setTextColor(YELLOW);
@@ -913,10 +936,11 @@ void runAxisCalibration() {
         specSlope = slopes[m / 2];
         specIntercept = intercepts[m / 2];
         axisDetected = true;
+        axisLocked = true;   // freeze the line until the next calibration
         clampSpectrumAxis();
         gfx->setTextColor(GREEN);
-        gfx->printf("Axis OK\n a = %+.4f\n b = %.1f px", specSlope, specIntercept);
-        Serial.printf("Axis calib: a=%.4f b=%.1f (from %d frames)\n",
+        gfx->printf("Axis OK (locked)\n a = %+.4f\n b = %.1f px", specSlope, specIntercept);
+        Serial.printf("Axis calib: a=%.4f b=%.1f (from %d frames, locked)\n",
                       specSlope, specIntercept, m);
     } else {
         gfx->setTextColor(RED);
@@ -933,6 +957,7 @@ void runAxisCalibration() {
     drawPredictButton(false);
     gfx->flush();
     lastFrameTime = millis();
+    return (m >= 5);
 }
 
 void runDarkFrame() {
@@ -996,7 +1021,8 @@ void handleCalButton() {
 
 // Serial fallback so axis calibration / dark frame / predict can be run
 // from the Serial Monitor without any button.
-//   c = axis calibration, d = dark frame, p = predict
+//   c = axis calibration (locks the line), d = dark frame, p = predict,
+//   a = release the axis lock and go back to auto tracking
 void handleSerialCommands() {
     while (Serial.available() > 0) {
         int c = Serial.read();
@@ -1006,6 +1032,9 @@ void handleSerialCommands() {
             runDarkFrame();
         } else if (c == 'p' || c == 'P') {
             triggerPrediction();
+        } else if (c == 'a' || c == 'A') {
+            axisLocked = false;
+            Serial.println("Axis lock released - auto tracking");
         }
     }
 }

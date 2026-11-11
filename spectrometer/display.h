@@ -30,7 +30,7 @@ extern bool modelReady;
 #define BTN_H        34
 
 bool initDisplay() {
-    Wire.begin(21, 22);
+    Wire.begin(I2C_SDA_GPIO, I2C_SCL_GPIO);
     TCA.begin();
     TCA.pinMode1(1, OUTPUT);
     TCA.write1(1, 1);
@@ -187,9 +187,9 @@ void drawInfo(float *spectrum, float maxVal, float fps) {
 
     gfx->setCursor(10, TEXT_Y + 40);
     gfx->setTextColor(YELLOW);
-    gfx->printf("Cols:%d Tmp:%d/%d Sm:%d a:%+.3f",
+    gfx->printf("Cols:%d Tmp:%d/%d Sm:%d a:%+.3f%s",
                 COL_AVG_RANGE * 2 + 1, temporalCount, TEMPORAL_FRAMES,
-                SMOOTH_WINDOW, specSlope);
+                SMOOTH_WINDOW, specSlope, axisLocked ? " LOCK" : "");
 
     gfx->setCursor(10, TEXT_Y + 55);
     if (darkFrameCaptured) {

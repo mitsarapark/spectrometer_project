@@ -50,7 +50,7 @@ Camera (RGB565 VGA 640x480)
 - [x] On-device inference (dot product) + แสดงผลบน LCD และเว็บ
 - [x] ปุ่ม PREDICT บนจอ (touch) + BOOT สำรอง
 - [x] Auto center-line: fit `x(y)=a*y+b` ตามแนวสเปกตรัม (แก้ tilt/offset) + overlay เอียงตามจริงบนเว็บ
-- [x] Axis calibration (ปุ่มที่สามหรือ `/calibrate`) สำหรับล็อกแนว/ความเอียง
+- [x] Axis calibration (ปุ่มที่สามหรือ `/calibrate`) → **lock แนวถาวรจนกว่าจะปลด** (`/axis/auto` หรือ serial `a`)
 - [x] Captive portal + mDNS (`http://spectrometer.local`) เข้าเว็บได้ทันทีหลังต่อ WiFi
 - [x] Serial commands: `c` (axis calibrate), `d` (dark frame), `p` (predict)
 - [x] แยกแสงหักเหข้างแถบหลักออกด้วย tracking window (±`AXIS_TRACK_WIN`)
@@ -120,7 +120,8 @@ python train_plsr.py --csv dataset.csv --unit "%"
 ## 8. Known issues
 
 - ค่า calibration เริ่มต้น map เต็มคอลัมน์เป็น 380–700 nm — ควรวัด 405/546 nm จากหลอด fluorescent จริงแล้วแก้ `CAL_*`
-- Touch (`0x3B`) ยังไม่ยืนยันบนฮาร์ดแวร์; ถ้าไม่เจอจะ fallback ไป BOOT
+- Touch: ย้ายไป bus **8/7 + Waveshare BSP** (`bsp_touch_init`) แล้ว — รอทดสอบบนฮาร์ดแวร์จริง
+- Axis lock (จาก `/calibrate`) ไม่เก็บลง NVS → reboot แล้วกลับไป auto tracking; ถ้าต้องการค่าคงที่ต้อง calibrate ใหม่ทุกครั้งที่บูต
 - **ปุ่มกายภาพยังไม่ผูกครบ**: `DARKFRAME_BUTTON_PIN = 0` (BOOT) และ `CAL_BUTTON_PIN = -1`; ต้องตั้งเมื่อรู้ GPIO จริง
 - ใช้ `/calibrate` หรือ serial `c` แทนปุ่ม calibrate ได้
 - `/capture` ดึงเฟรมใหม่แยกจาก loop → บางรอบ measurement frame ถูกใช้ไป

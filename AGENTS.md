@@ -37,7 +37,7 @@
 - ปุ่ม PREDICT บนจอ (ถ้า touch ใช้ได้) + BOOT สำรอง
 
 **ยังค้าง / ต้องทำต่อ**
-- **Touch ยังไม่เจอ** (`0x3B: not found`) → ต้องสแกน I2C bus อีกที
+- **Touch**: เดิมไม่เจอ (`0x3B: not found`) เพราะ Bus เดิม 21/22 ผิด — แก้เป็น **8/7 + Waveshare BSP** (`bsp_touch_init`) แล้ว รอทดสอบบนเครื่อง
 - **ปุ่มกายภาพ**: ผู้ใช้บอก BOOT ใช้ไม่ได้ และมีปุ่มอื่นทำ dark/predict อยู่ — ยังไม่ทราบ GPIO
   (`DARKFRAME_BUTTON_PIN = 0`, `CAL_BUTTON_PIN = -1` ต้องแก้เมื่อรู้ GPIO)
 - **Wavelength calibration จริง** (405/546 nm จากหลอด fluorescent) ยังไม่ได้วัด
@@ -57,7 +57,7 @@ spectrometer/                 <-- sketch หลัก (ชื่อโฟลเ�
   dataset.h                   CSV ลง LittleFS หรือ FFat + นับ sample + clear
   inference.h                 PLS dot product บนเครื่อง
   model_weights.h             โมเดลจาก ml/ (placeholder => MODEL_READY 0)
-  touch.h                     อ่าน touch AXS15231B @ 0x3B (fallback ไป BOOT)
+  touch.h                     อ่าน touch AXS15231B @ 0x3B ผ่าน BSP (bus 8/7, fallback ไป BOOT)
 ml/                           เทรน PLSR บน PC
   train_plsr.py               CSV -> augment -> CV เลือก n_components -> export header
   augment.py                  noise / baseline / gain drift
@@ -87,12 +87,13 @@ README.md                     ภาพรวม + build/flash
 LCD QSPI : CS=12, CLK=5, D0=1, D1=2, D2=3, D3=4, BL=6
 Camera   : XCLK=38, SIOD=8, SIOC=7, D7..D0=21,39,40,42,46,48,47,45,
            VSYNC=17, HREF=18, PCLK=41, PWDN=-1, RESET=-1
-I2C      : SDA=21, SCL=22 (TCA9554 @0x20, touch @0x3B)
+I2C      : SDA=8, SCL=7 (TCA9554 @0x20, touch @0x3B — แชร์กับ camera SCCB)
 BOOT     : GPIO0 (INPUT_PULLUP, active LOW)
 ```
 
-> หมายเหตุ: pin map นี้มาจากโค้ดที่ใช้งานได้จริง แต่ GPIO21 ซ้ำกับ camera D7
-> ถ้า touch ยังไม่เจอ ให้สงสัย bus นี้ก่อน (ลองสแกน 8/7)
+> หมายเหตุ: touch/TCA9554 อยู่บน **8/7** ไม่ใช่ 21/22 (GPIO21 เป็น camera D7)
+> `initTouch()` ต้อง `Wire.end()/Wire.begin(8,7)` ใหม่หลัง `esp_camera_init()`
+> เพราะกล้องยึด pad เดียวกันไปแล้ว
 
 ---
 
@@ -160,6 +161,10 @@ Axis detection (`spectrum_processing.h`):
 | `AXIS_REFINE_WIN` | 8 | หน้าต่าง centroid รอบ peak |
 | `AXIS_PEAK_FRACTION` | 0.5 | row peak ต้อง ≥ ครึ่งของ frame peak |
 
+**Axis lock**: `/calibrate` (หรือปุ่มที่สาม/serial `c`) จะ fit 20 เฟรม → median `a`,`b` แล้ว **ล็อก**
+(`axisLocked = true`) ทำให้ `updateSpectrumAxis()` หยุด track จนกว่าจะปล่อยด้วย serial `a` หรือ `/axis/auto`
+(หรือ reboot) — ค่า lock ไม่ได้เก็บลง NVS
+
 ---
 
 ## 7. Web UI / Endpoints
@@ -172,8 +177,9 @@ Axis detection (`spectrum_processing.h`):
 | `/record?conc=<value>` | บันทึกแถว CSV (ปฏิเสธถ้าสเปกตรัมเก่า > 3 s) |
 | `/dataset.csv` | ดาวน์โหลด CSV |
 | `/dataset/clear` | ล้าง dataset |
-| `/calibrate` | เก็บ 20 เฟรม → median `a`,`b` แล้วล็อกแนว |
-| `/axis` | `{"a":..,"b":..,"detected":..}` |
+| `/calibrate` | เก็บ 20 เฟรม → median `a`,`b` แล้ว **lock** แนว (คืน `ok`,`locked`) |
+| `/axis` | `{"a":..,"b":..,"detected":..,"locked":..}` |
+| `/axis/auto` | ปลดล็อก กลับไป auto tracking |
 | `/ping` | `pong` (ทดสอบเร็ว) |
 
 อื่น ๆ: captive portal redirect ทุก path ที่ไม่รู้จัก, `[443]` probe log เมื่อ browser ใช้ HTTPS
@@ -186,9 +192,10 @@ Axis detection (`spectrum_processing.h`):
 |---|---|
 | BOOT สั้น (<1.5 s) | predict |
 | BOOT ค้าง (>=1.5 s) | dark frame |
-| `CAL_BUTTON_PIN` (ถ้าตั้ง) | axis calibration |
+| `CAL_BUTTON_PIN` (ถ้าตั้ง) | axis calibration (lock แนว) |
 | Touch ปุ่ม PREDICT บนจอ | predict (ถ้า touch เจอ) |
-| Serial `c` | axis calibration |
+| Serial `c` | axis calibration (lock แนว) |
+| Serial `a` | ปลด lock กลับไป auto tracking |
 | Serial `d` | dark frame |
 | Serial `p` | predict |
 
@@ -259,7 +266,7 @@ Serial commands: c=axis calibrate, d=dark frame, p=predict
 
 ## 12. Known issues / gotchas
 
-- **Touch ยังไม่เจอ** บนบอร์ดจริง → fallback BOOT; ต้องลองสแกน bus 8/7 หรือ address อื่น
+- **Touch**: แก้เป็น bus **8/7 + BSP** แล้ว (เดิม 21/22 ผิด) — ถ้ายังไม่ขึ้นให้ดู log `Touch 0x3B:` ตอนบูต และ fallback ไป BOOT
 - **ปุ่มจริงยังไม่ผูก**: BOOT อาจเสีย, ต้องตั้ง `DARKFRAME_BUTTON_PIN`/`CAL_BUTTON_PIN` ให้ตรง
 - **Stack**: ห้าม array ใหญ่ (~2 KB+) บน stack ของ loop task; ใช้ `static` (เคย crash canary)
 - ค่า calibration เป็น 380–700 แบบ uncalibrated; ต้องวัดหลอด fluorescent จริง
@@ -273,7 +280,7 @@ Serial commands: c=axis calibrate, d=dark frame, p=predict
 
 ## 13. กติกาการทำงาน
 
-- **ทุกครั้งที่แก้ไฟล์ ให้ commit ทันที** หลังตรวจแล้ว
+- **ทุกครั้งที่แก้ไฟล์ ให้ commit ทันที** หลังตรวจแล้ว การ commit แต่ละครั้งให้ใส่สิ่งที่ทำลงไปไม่ใช่ชื่อมั่ว
 - ก่อน commit: `git status`, `git diff`, เช็กไม่มี secret
 - commit message สั้น ตรงงาน prefix: `feat:`, `fix:`, `refactor:`, `docs:`, `chore:`
 - **ห้าม push ขึ้น remote เอง** เว้นแต่ผู้ใช้สั่ง

@@ -55,6 +55,11 @@ uint8_t temporalCount = 0; // how many real frames have been fed in so far (<= T
 float specSlope = 0.0f;             // a (pixels per row)
 float specIntercept = (float)CENTER_COL; // b (column at row 0)
 bool  axisDetected = false;
+// Set when the axis is calibrated manually (BOOT/3rd button, serial 'c' or
+// /calibrate). While locked the per-frame tracker leaves the line alone,
+// so a manual calibration is not slowly pulled back to the auto fit.
+// Cleared by a later calibration or by serial 'a' / /axis/auto.
+bool  axisLocked = false;
 
 #ifndef AXIS_AUTO_DETECT
 #define AXIS_AUTO_DETECT 1
@@ -254,8 +259,13 @@ static inline void clampSpectrumAxis() {
 }
 
 // Per-frame update with exponential smoothing. Keeps the previous line
-// when the frame has no usable signal.
+// when the frame has no usable signal. Does nothing while the axis is
+// locked by a manual calibration.
 bool updateSpectrumAxis(camera_fb_t *fb) {
+    if (axisLocked) {
+        (void)fb;
+        return true;
+    }
 #if AXIS_AUTO_DETECT
     float a = 0.0f, b = 0.0f;
     if (!fitSpectrumAxis(fb, a, b)) return false;
