@@ -168,3 +168,4 @@ Debug exception reason: Stack canary watchpoint triggered (loopTask)
   - `a26213b` feat: add AP/dataset diagnostics and /ping endpoint
   - `b3be4d2` feat: support FFat partitions, add captive portal and mDNS
   - `3604d8b` fix: start web server before boot splash; add AP event and TLS probe logs
+  - `af1a461` fix: move large spectrum buffers off the loop stack (stack canary crash)
