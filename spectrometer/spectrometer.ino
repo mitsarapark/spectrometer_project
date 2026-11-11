@@ -173,6 +173,9 @@ const char* ssid     = "ITIM-project";
 const char* password = "itimsarapark";
 WebServer server(80);
 DNSServer dnsServer;
+// Diagnostic listener: tells us when a browser tries HTTPS (port 443)
+// instead of plain HTTP, which is a common reason "the page never loads".
+WiFiServer httpsProbe(443);
 
 #include "inference.h"
 #include "dataset.h"
@@ -638,6 +641,15 @@ void handleDatasetClear() {
 // ============================================================
 // SETUP
 // ============================================================
+void onWiFiEvent(WiFiEvent_t event, WiFiEventInfo_t info) {
+    if (event == ARDUINO_EVENT_WIFI_AP_STACONNECTED) {
+        Serial.printf("[ap] client connected (aid=%u)\n",
+                      (unsigned)info.wifi_ap_staconnected.aid);
+    } else if (event == ARDUINO_EVENT_WIFI_AP_STADISCONNECTED) {
+        Serial.println("[ap] client disconnected");
+    }
+}
+
 void setup() {
     Serial.begin(115200);
     while (!Serial && millis() < 3000);
@@ -663,9 +675,11 @@ void setup() {
     resetTemporalBuffer();
 
     // Init WiFi AP
+    WiFi.onEvent(onWiFiEvent);
     if (!WiFi.softAP(ssid, password)) {
         Serial.println("WiFi AP failed to start!");
     }
+    WiFi.setSleep(false);
     IPAddress IP = WiFi.softAPIP();
     Serial.print("WiFi AP started: ");
     Serial.println(ssid);
@@ -684,21 +698,9 @@ void setup() {
         Serial.println("mDNS: http://spectrometer.local");
     }
 
-    // Show IP on LCD
-    gfx->fillScreen(BLACK);
-    gfx->setTextColor(CYAN);
-    gfx->setCursor(10, 200);
-    gfx->println("WiFi AP Started");
-    gfx->setCursor(10, 220);
-    gfx->print("SSID: ");
-    gfx->println(ssid);
-    gfx->setCursor(10, 240);
-    gfx->print("IP: ");
-    gfx->println(IP.toString());
-    gfx->flush();
-    delay(3000);
-
-    // Setup web server
+    // Web server must be listening BEFORE the boot splash delay,
+    // otherwise a client that joins the AP right away gets
+    // "connection refused" and no request ever reaches the board.
     server.on("/", HTTP_GET, handleRoot);
     server.on("/data", HTTP_GET, handleData);
     server.on("/capture", HTTP_GET, handleCapture);
@@ -719,11 +721,31 @@ void setup() {
         server.send(302, "text/plain", "");
     });
     server.begin();
+    httpsProbe.begin();
     Serial.println("Web server started on port 80");
+    Serial.printf("Open: http://%s/   (no port needed, HTTP/80)\n",
+                  WiFi.softAPIP().toString().c_str());
 
     // Dataset storage + touch panel
     initDataset();
     initTouch();
+
+    // Show IP on LCD (boot splash)
+    gfx->fillScreen(BLACK);
+    gfx->setTextColor(CYAN);
+    gfx->setCursor(10, 200);
+    gfx->println("WiFi AP Started");
+    gfx->setCursor(10, 220);
+    gfx->print("SSID: ");
+    gfx->println(ssid);
+    gfx->setCursor(10, 240);
+    gfx->print("IP: ");
+    gfx->println(IP.toString());
+    gfx->setCursor(10, 258);
+    gfx->setTextSize(1);
+    gfx->println("http://192.168.4.1");
+    gfx->flush();
+    delay(1500);
 
     // Initial LCD screen
     gfx->fillScreen(BLACK);
@@ -830,6 +852,17 @@ void loop() {
     // Always handle web clients (non-blocking)
     server.handleClient();
     dnsServer.processNextRequest();
+
+    // Accept and immediately close HTTPS attempts so the serial log can
+    // show that the browser was trying https:// instead of http://.
+    {
+        WiFiClient probe = httpsProbe.available();
+        if (probe) {
+            Serial.printf("[443] TLS attempt from %s - use http:// not https://\n",
+                          probe.remoteIP().toString().c_str());
+            probe.stop();
+        }
+    }
 
     // Heartbeat: confirms the firmware is alive and whether a client is
     // actually associated with the AP (stations stays 0 if the phone/PC
