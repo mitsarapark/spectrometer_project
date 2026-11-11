@@ -321,3 +321,4 @@ Serial commands: c=axis calibrate, d=dark frame, p=predict
 | `a526655` | serial commands c/d/p |
 | `9687e08` | แก้ scope bug ของ axis fit |
 | `3d13bab` | เปลี่ยนเป็น track แถบหลัก (กันแสงหักเหข้าง ๆ) |
+| `68ccbcd` | lock แนวเมื่อ calibrate + ย้าย touch ไป I2C 8/7 ด้วย BSP driver |
