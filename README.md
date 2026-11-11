@@ -10,6 +10,7 @@
 - [`AGENTS.md`](AGENTS.md) — คู่มือสำหรับ AI agent / ผู้พัฒนาต่อ
 - [`PROJECT_STATUS.md`](PROJECT_STATUS.md) — สถานะงาน, ค่าคอนฟิก, known issues, roadmap
 - [`ml/README.md`](ml/README.md) — ขั้นตอนเก็บ dataset และเทรนโมเดล
+- [`problem.md`](problem.md) — บันทึกปัญหาที่เจอ สาเหตุ และวิธีแก้
 
 ## โครงสร้าง
 
