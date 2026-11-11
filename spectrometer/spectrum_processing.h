@@ -264,7 +264,7 @@ static bool fitLineRobust(const int16_t *ys, const float *xs, int n,
 //      drift picked up during the walk and recovers the dim ends,
 //   5. robust refit + sanity checks.
 // Returns false when there is not enough light / too few valid rows.
-bool fitSpectrumAxis(camera_fb_t *fb, float &outA, float &outB) {
+static bool fitSpectrumAxisWalk(camera_fb_t *fb, float &outA, float &outB) {
     const uint16_t *pix = (const uint16_t *)fb->buf;
     const int maxPts = FRAME_HEIGHT / AXIS_ROW_STEP + 2;
     static int16_t ptsY[maxPts];
@@ -366,6 +366,162 @@ bool fitSpectrumAxis(camera_fb_t *fb, float &outA, float &outB) {
     outA = a;
     outB = b;
     return true;
+}
+
+// Shear projection fit. The band is a straight line x = a*y + b, so instead
+// of deciding row by row where it is, shift every row by a*y and sum the
+// rows into one column profile: with the right `a` all rows stack into a
+// tall, narrow peak. `a` is the trial slope that maximises the profile
+// variance (coarse sweep, then fine sweep); `b` is the half-max midpoint of
+// that peak. Uses every pixel, so short bands, noise and dim ends cannot
+// break it.
+#define AXIS_PROJ_STEP     4       // row step of the cached luma image
+#define AXIS_PROJ_OFFSET   160     // profile offset (>= max |a|*FRAME_HEIGHT)
+#define AXIS_PROJ_PROFILE  (FRAME_WIDTH + 2 * AXIS_PROJ_OFFSET)
+
+static float projectionProfile(const uint8_t *L, int rows, float a, uint32_t *prof) {
+    for (int i = 0; i < AXIS_PROJ_PROFILE; i++) prof[i] = 0;
+    for (int r = 0; r < rows; r++) {
+        int s = (int)lroundf(a * (float)(r * AXIS_PROJ_STEP));
+        uint32_t *dst = prof + AXIS_PROJ_OFFSET - s;
+        const uint8_t *src = L + (size_t)r * FRAME_WIDTH;
+        for (int x = 0; x < FRAME_WIDTH; x++) dst[x] += src[x];
+    }
+    // variance-like sharpness score (scaled to stay in float range)
+    float mean = 0.0f;
+    for (int i = 0; i < AXIS_PROJ_PROFILE; i++) mean += (float)prof[i];
+    mean /= (float)AXIS_PROJ_PROFILE;
+    float score = 0.0f;
+    for (int i = 0; i < AXIS_PROJ_PROFILE; i++) {
+        float d = ((float)prof[i] - mean) / (float)rows;
+        score += d * d;
+    }
+    return score;
+}
+
+static bool fitSpectrumAxisProjection(camera_fb_t *fb, float &outA, float &outB) {
+    const uint16_t *pix = (const uint16_t *)fb->buf;
+    const int rows = FRAME_HEIGHT / AXIS_PROJ_STEP;
+
+    uint8_t *L = (uint8_t *)heap_caps_malloc((size_t)rows * FRAME_WIDTH,
+                                             MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    if (!L) L = (uint8_t *)heap_caps_malloc((size_t)rows * FRAME_WIDTH, MALLOC_CAP_8BIT);
+    if (!L) return false;
+    static uint32_t prof[AXIS_PROJ_PROFILE];
+
+    int globalPeak = 0;
+    for (int r = 0; r < rows; r++) {
+        const uint16_t *row = pix + (size_t)(r * AXIS_PROJ_STEP) * FRAME_WIDTH;
+        uint8_t *dst = L + (size_t)r * FRAME_WIDTH;
+        for (int x = 0; x < FRAME_WIDTH; x++) {
+            uint8_t v = pixelLuma(row[x]);
+            dst[x] = v;
+            if (v > globalPeak) globalPeak = v;
+        }
+    }
+    if (globalPeak < AXIS_MIN_BRIGHT) { free(L); return false; }
+
+    float bestA = 0.0f, bestScore = -1.0f;
+    for (float a = -AXIS_MAX_SLOPE; a <= AXIS_MAX_SLOPE + 1e-6f; a += 0.01f) {
+        float sc = projectionProfile(L, rows, a, prof);
+        if (sc > bestScore) { bestScore = sc; bestA = a; }
+    }
+    const float coarseA = bestA;
+    for (float a = coarseA - 0.012f; a <= coarseA + 0.012f + 1e-6f; a += 0.0005f) {
+        if (fabsf(a) > AXIS_MAX_SLOPE) continue;
+        float sc = projectionProfile(L, rows, a, prof);
+        if (sc > bestScore) { bestScore = sc; bestA = a; }
+    }
+    free(L);
+    L = nullptr;
+
+    // Rebuild the best profile from the full-resolution frame rows (every
+    // 2nd row) for a cleaner peak than the cached 4-row image.
+    for (int i = 0; i < AXIS_PROJ_PROFILE; i++) prof[i] = 0;
+    int nrows = 0;
+    for (int y = 0; y < FRAME_HEIGHT; y += 2) {
+        int s = (int)lroundf(bestA * (float)y);
+        uint32_t *dst = prof + AXIS_PROJ_OFFSET - s;
+        const uint16_t *row = pix + (size_t)y * FRAME_WIDTH;
+        for (int x = 0; x < FRAME_WIDTH; x++) dst[x] += pixelLuma(row[x]);
+        nrows++;
+    }
+
+    // peak of the 5-sample smoothed profile
+    int pk = -1;
+    float pkv = -1.0f;
+    for (int i = 2; i < AXIS_PROJ_PROFILE - 2; i++) {
+        float v = (float)(prof[i - 2] + prof[i - 1] + prof[i] + prof[i + 1] + prof[i + 2]) * 0.2f;
+        if (v > pkv) { pkv = v; pk = i; }
+    }
+    if (pk < 0) return false;
+
+    const int lo = (pk - 60 > 0) ? pk - 60 : 0;
+    const int hi = (pk + 60 < AXIS_PROJ_PROFILE - 1) ? pk + 60 : AXIS_PROJ_PROFILE - 1;
+    float base = 1e30f;
+    for (int i = lo; i <= hi; i++) if ((float)prof[i] < base) base = (float)prof[i];
+
+    float contrast = (pkv - base) / (float)nrows;     // mean luma above base per row
+    if (contrast < (float)AXIS_MIN_BRIGHT * 0.5f) return false;
+
+    const float thr = base + 0.5f * (pkv - base);
+    int xl = pk, xr = pk;
+    while (xl > lo && (float)prof[xl - 1] >= thr) xl--;
+    while (xr < hi && (float)prof[xr + 1] >= thr) xr++;
+    float left = (float)xl, right = (float)xr;
+    if (xl > lo) {
+        float p0 = (float)prof[xl - 1], p1 = (float)prof[xl];
+        if (p1 > p0) left = (float)(xl - 1) + (thr - p0) / (p1 - p0);
+    }
+    if (xr < hi) {
+        float p0 = (float)prof[xr], p1 = (float)prof[xr + 1];
+        if (p0 > p1) right = (float)xr + (p0 - thr) / (p0 - p1);
+    }
+    if (xl == lo && xr == hi) return false;            // no distinct peak
+    if (right - left > 80.0f) return false;            // too broad: not a band
+
+    float b = 0.5f * (left + right) - (float)AXIS_PROJ_OFFSET;
+    if (!isfinite(b) || b < 0.0f || b > (float)FRAME_WIDTH) return false;
+
+    // Refine: per-row half-max centers guided by the projected line, then a
+    // robust fit. The projection only needs to be roughly right; this pass
+    // recovers the sub-pixel slope on the rows that actually carry signal.
+    float a = bestA;
+    {
+        int minPeak = (int)((float)globalPeak * AXIS_PEAK_FRACTION);
+        if (minPeak < AXIS_MIN_BRIGHT) minPeak = AXIS_MIN_BRIGHT;
+        const int maxPts = FRAME_HEIGHT / AXIS_ROW_STEP + 2;
+        static int16_t ptsY[maxPts];
+        static float ptsX[maxPts];
+        static uint8_t keep[maxPts];
+        int n = 0;
+        for (int y = 0; y < FRAME_HEIGHT; y += AXIS_ROW_STEP) {
+            float pred = a * (float)y + b;
+            float c = bandCenterNear(pix, y, pred, minPeak);
+            if (c < 0.0f || fabsf(c - pred) > (float)AXIS_PRED_WIN * 0.5f) continue;
+            ptsY[n] = (int16_t)y;
+            ptsX[n] = c;
+            n++;
+        }
+        float ra, rb;
+        if (n >= AXIS_MIN_ROWS && fitLineRobust(ptsY, ptsX, n, keep, ra, rb) &&
+            isfinite(ra) && isfinite(rb) && fabsf(ra) <= AXIS_MAX_SLOPE) {
+            float yMid = 0.5f * (float)FRAME_HEIGHT;
+            if (fabsf((ra * yMid + rb) - (a * yMid + b)) < 6.0f) {
+                a = ra;
+                b = rb;
+            }
+        }
+    }
+
+    outA = a;
+    outB = b;
+    return true;
+}
+
+bool fitSpectrumAxis(camera_fb_t *fb, float &outA, float &outB) {
+    if (fitSpectrumAxisProjection(fb, outA, outB)) return true;
+    return fitSpectrumAxisWalk(fb, outA, outB);
 }
 
 // Keep the fitted line inside the sensor so every sampled row still has
