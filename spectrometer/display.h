@@ -183,19 +183,22 @@ void drawInfo(float *spectrum, float maxVal, float fps) {
     gfx->setTextSize(1);
     gfx->setTextColor(WHITE);
     gfx->setCursor(10, TEXT_Y + 25);
-    gfx->printf("Max:%.1f/%.0f  FPS:%.1f", maxVal, DISPLAY_MAX_INTENSITY, fps);
+    gfx->printf("Max Int: %.1f (scale 0-%d)  FPS: %.1f", maxVal, (int)DISPLAY_MAX_INTENSITY, fps);
 
     gfx->setCursor(10, TEXT_Y + 40);
     gfx->setTextColor(YELLOW);
-    gfx->printf("a:%.4f  b:%.0f  conf:%.0f%%",
-                centerSlope, centerOffset, centerConfidence * 100.0f);
+    gfx->printf("Cols:%d Tmp:%d/%d Sm:%d a:%+.3f",
+                COL_AVG_RANGE * 2 + 1, temporalCount, TEMPORAL_FRAMES,
+                SMOOTH_WINDOW, specSlope);
 
     gfx->setCursor(10, TEXT_Y + 55);
-    if (darkFrameCaptured) gfx->setTextColor(GREEN);
-    else gfx->setTextColor(RED);
-    gfx->printf("Dark:%s  Cols:%d  Avg:%d/%d",
-                darkFrameCaptured ? "ON" : "OFF",
-                COL_AVG_RANGE * 2 + 1, temporalCount, TEMPORAL_FRAMES);
+    if (darkFrameCaptured) {
+        gfx->setTextColor(GREEN);
+        gfx->print("Dark frame: ON");
+    } else {
+        gfx->setTextColor(RED);
+        gfx->print("Dark frame: OFF (hold BOOT)");
+    }
 
     gfx->setCursor(10, TEXT_Y + 70);
     if (!modelReady) {

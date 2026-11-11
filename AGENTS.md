@@ -58,8 +58,8 @@ BOOT button: GPIO0 (INPUT_PULLUP, active LOW)
 
 ```
 esp_camera_fb_get() [RGB565 VGA 640x480]
-  -> detectCenterLine()       fit x(y) = a*y + b on the brightest column per row
-  -> extractSpectrum()        center column +/- COL_AVG_RANGE **along that line**
+  -> updateSpectrumAxis()     fit x(y)=a*y+b ต่อแนวสเปกตรัม (auto tilt/offset)
+  -> extractSpectrum()        อ่านตามแนวที่ fit แล้ว ± COL_AVG_RANGE, per row -> R/G/B
   -> applyDarkFrameSubtraction()
   -> applyTemporalAverage()   TEMPORAL_FRAMES frames
   -> applyMovingAverage()     SMOOTH_WINDOW
@@ -92,12 +92,11 @@ esp_camera_fb_get() [RGB565 VGA 640x480]
 | การกระทำ | ผล |
 |---|---|
 | แตะปุ่ม **PREDICT** บนจอ | ทำนายความเข้มข้น (ถ้า `MODEL_READY 1`) |
-| `BTN_MAIN_PIN` กดสั้น (< 1.5 s) | ทำนายความเข้มข้น |
-| `BTN_MAIN_PIN` กดค้าง (>= 1.5 s) | จับ dark frame |
-| `BTN_CAL_PIN` กดสั้น | Center-line calibration (ล็อกค่า a, b) |
-| `BTN_CAL_PIN` กดค้าง | รายงาน peak สำหรับ wavelength calibration (ยังไม่ apply) |
-
-ค่า default: `BTN_MAIN_PIN = 0` (BOOT), `BTN_CAL_PIN = -1` (ปิดไว้) — ต้องตั้งเป็น GPIO จริงของบอร์ด
+| กด BOOT สั้น (< 1.5 s) | ทำนายความเข้มข้น (สำรองเมื่อ touch ใช้ไม่ได้) |
+| กด BOOT ค้าง (>= 1.5 s) | จับ dark frame |
+| ปุ่มที่สาม (`CAL_BUTTON_PIN`, default `-1`) | Axis calibration (ปรับความเอียง/offset) |
+| `http://192.168.4.1/calibrate` | Axis calibration ผ่านเว็บ (ไม่ต้องมีปุ่ม) |
+| `http://192.168.4.1/axis` | ดูค่า `a`, `b`, `detected` |
 
 ## 7. ML workflow (สรุป)
 

@@ -102,14 +102,14 @@ Arduino_Canvas *gfx = new Arduino_Canvas(320, 480, g, 0, 0, ROTATION);
 #define MANUAL_EXPOSURE   300
 #define MANUAL_GAIN       0
 
-// Physical buttons (active LOW, INPUT_PULLUP). Set the real GPIO numbers
-// for this build; use -1 to disable one.
-//   BTN_MAIN_PIN : short press = predict, long press = dark frame
-//   BTN_CAL_PIN  : short press = center-line calibration,
-//                  long press  = wavelength peak report (not applied yet)
-#define BTN_MAIN_PIN          0
-#define BTN_CAL_PIN          -1
+// Onboard BOOT button: short press = predict, long press = dark frame
+#define DARKFRAME_BUTTON_PIN  0
 #define DARKFRAME_HOLD_MS     1500
+
+// Optional third button for axis calibration (spectrum tilt/offset).
+// Set to the GPIO number once the button is wired; -1 disables it.
+// /calibrate on the web page works without any button.
+#define CAL_BUTTON_PIN        -1
 
 // How the R/G/B channels are combined into the single displayed /
 // recorded intensity value (see combineForDisplay()).
@@ -238,7 +238,7 @@ h1 { color: #00d4ff; margin-bottom: 8px; }
 <body>
 <div class="container">
 <h1>ðŸ”¬ ESP32-S3 Spectrometer</h1>
-<div class="sub">Live Spectrum + Web Camera | <span id="conn">Connecting...</span> | <span id="center">center: --</span></div>
+<div class="sub">Live Spectrum + Web Camera | <span id="conn">Connecting...</span></div>
 <div class="info">
   <div class="box"><h3>Peak Wavelength</h3><div id="peak">-- nm</div></div>
   <div class="box"><h3>Max Intensity</h3><div id="max">--</div></div>
@@ -260,6 +260,7 @@ h1 { color: #00d4ff; margin-bottom: 8px; }
     <label for="concInput">Concentration</label>
     <input id="concInput" type="number" step="0.01" value="0">
     <button id="recordBtn">Record sample</button>
+    <button id="calBtn">Calibrate axis</button>
     <a id="dlLink" href="/dataset.csv"><button>Download CSV</button></a>
     <button id="clearBtn">Clear</button>
   </div>
@@ -365,16 +366,14 @@ async function update() {
         document.getElementById('dsStatus').textContent = 'samples: '+j.samples;
         document.getElementById('conn').textContent='Connected';
         document.getElementById('conn').style.color='#00ff88';
-        if (j.slope !== undefined) {
-            camMeta.slope = j.slope;
-            camMeta.offset = j.offset;
+        if (j.col !== undefined) {
+            camMeta.col = j.col;
             camMeta.colRange = j.colRange;
             camMeta.frameWidth = j.frameWidth;
             camMeta.frameHeight = j.frameHeight;
-            camMeta.valid = j.centerValid;
-            document.getElementById('center').textContent =
-                'center: a=' + j.slope.toFixed(4) + ' b=' + j.offset.toFixed(0) +
-                ' conf=' + j.conf + '%' + (j.centerValid ? '' : ' (fallback)');
+            camMeta.axisA = j.axisA;
+            camMeta.axisB = j.axisB;
+            camMeta.axisOn = j.axisOn;
             if (document.getElementById('camImg').complete) resizeCamOverlay();
         }
         drawSpectrum(j.spectrum, j.scale, j.nmStart, j.nmEnd);
@@ -412,17 +411,37 @@ async function clearDataset() {
     }
 }
 
+async function calibrateAxis() {
+    const el = document.getElementById('dsStatus');
+    el.textContent = 'calibrating axis...';
+    el.style.color = '#ffaa00';
+    try {
+        const r = await fetch('/calibrate');
+        const j = await r.json();
+        el.textContent = 'axis a=' + j.a.toFixed(4) + '  b=' + j.b.toFixed(1) + ' px';
+        el.style.color = '#00ff88';
+    } catch (e) {
+        el.textContent = 'axis calibration failed';
+        el.style.color = '#ff4444';
+    }
+}
+
 document.getElementById('recordBtn').addEventListener('click', recordSample);
+document.getElementById('calBtn').addEventListener('click', calibrateAxis);
 document.getElementById('clearBtn').addEventListener('click', clearDataset);
 
 function updateCam() {
     document.getElementById('camImg').src='/capture?t='+Date.now();
 }
 
-// Vertical line + shaded band overlay showing the tracked centre of the
-// spectrum band. The firmware fits x(y) = a*y + b on every frame, so the
-// overlay follows the tilt (angular offset) and horizontal offset.
-let camMeta = { slope: 0, offset: 320, colRange: 10, frameWidth: 640, frameHeight: 480, valid: false };
+// Tilted line + shaded band overlay showing the measured spectrum axis
+// x(y) = axisA * y + axisB (and the +/- COL_AVG_RANGE columns averaged
+// around it). Falls back to a vertical line at `col` when auto-detection
+// has not locked onto the band yet. Metadata comes from /data.
+let camMeta = {
+    col: 320, colRange: 10, frameWidth: 640, frameHeight: 480,
+    axisA: 0, axisB: 320, axisOn: false
+};
 
 function resizeCamOverlay() {
     const img = document.getElementById('camImg');
@@ -433,25 +452,31 @@ function resizeCamOverlay() {
     c.clearRect(0,0,ov.width,ov.height);
     if (!ov.width || !ov.height) return;
 
-    const W = camMeta.frameWidth, H = camMeta.frameHeight;
-    const px = (row) => ((camMeta.slope * row + camMeta.offset) / W) * ov.width;
-    const half = (camMeta.colRange / W) * ov.width;
-    const xTop = px(0), xBot = px(H - 1);
+    const sx = ov.width / camMeta.frameWidth;
+    const sy = ov.height / camMeta.frameHeight;
+    const a = camMeta.axisOn ? camMeta.axisA : 0;
+    const b = camMeta.axisOn ? camMeta.axisB : camMeta.col;
 
-    c.fillStyle = camMeta.valid ? 'rgba(255,221,0,0.18)' : 'rgba(255,80,80,0.15)';
+    const x0 = (b + a * 0) * sx;
+    const x1 = (b + a * camMeta.frameHeight) * sx;
+    const half = camMeta.colRange * sx;
+
+    // Shaded band following the fitted line.
+    c.fillStyle = 'rgba(255,221,0,0.18)';
     c.beginPath();
-    c.moveTo(xTop - half, 0);
-    c.lineTo(xTop + half, 0);
-    c.lineTo(xBot + half, ov.height);
-    c.lineTo(xBot - half, ov.height);
+    c.moveTo(x0-half, 0);
+    c.lineTo(x1-half, ov.height);
+    c.lineTo(x1+half, ov.height);
+    c.lineTo(x0+half, 0);
     c.closePath();
     c.fill();
 
-    c.strokeStyle = camMeta.valid ? '#ffdd00' : '#ff6666';
+    // Center line.
+    c.strokeStyle = '#ffdd00';
     c.lineWidth = 2;
     c.beginPath();
-    c.moveTo(xTop, 0);
-    c.lineTo(xBot, ov.height);
+    c.moveTo(x0, 0);
+    c.lineTo(x1, ov.height);
     c.stroke();
 }
 document.getElementById('camImg').addEventListener('load', resizeCamOverlay);
@@ -560,6 +585,12 @@ void handleData() {
     json += String(pixelToNm(0), 1);
     json += ",\"nmEnd\":";
     json += String(pixelToNm(SPECTRUM_LEN - 1), 1);
+    json += ",\"axisA\":";
+    json += String(specSlope, 5);
+    json += ",\"axisB\":";
+    json += String(specIntercept, 2);
+    json += ",\"axisOn\":";
+    json += axisDetected ? "true" : "false";
     json += ",\"col\":";
     json += String(CENTER_COL);
     json += ",\"colRange\":";
@@ -568,14 +599,6 @@ void handleData() {
     json += String(FRAME_WIDTH);
     json += ",\"frameHeight\":";
     json += String(FRAME_HEIGHT);
-    json += ",\"centerValid\":";
-    json += centerValid ? "true" : "false";
-    json += ",\"slope\":";
-    json += String(centerSlope, 5);
-    json += ",\"offset\":";
-    json += String(centerOffset, 1);
-    json += ",\"conf\":";
-    json += String(centerConfidence * 100.0f, 0);
     json += ",\"modelReady\":";
     json += MODEL_READY ? "true" : "false";
     json += ",\"hasPred\":";
@@ -671,6 +694,30 @@ void handleDatasetClear() {
     server.send(200, "application/json", "{\"ok\":true}");
 }
 
+// ---------------- Axis calibration / status endpoints ----------------
+void runAxisCalibration(); // defined with the button handlers below
+
+void handleCalibrate() {
+    runAxisCalibration();
+    String out = "{\"ok\":true,\"a\":";
+    out += String(specSlope, 5);
+    out += ",\"b\":";
+    out += String(specIntercept, 2);
+    out += "}";
+    server.send(200, "application/json", out);
+}
+
+void handleAxis() {
+    String out = "{\"a\":";
+    out += String(specSlope, 5);
+    out += ",\"b\":";
+    out += String(specIntercept, 2);
+    out += ",\"detected\":";
+    out += axisDetected ? "true" : "false";
+    out += "}";
+    server.send(200, "application/json", out);
+}
+
 // ============================================================
 // SETUP
 // ============================================================
@@ -689,9 +736,9 @@ void setup() {
 
     Serial.println("\n=== ESP32-S3 Spectrometer + Web (AP mode, column-center, RGB-separate) ===");
 
-    pinMode(BTN_MAIN_PIN, INPUT_PULLUP);   // main button: predict / dark frame
-#if BTN_CAL_PIN >= 0
-    pinMode(BTN_CAL_PIN, INPUT_PULLUP);    // calibration button
+    pinMode(DARKFRAME_BUTTON_PIN, INPUT_PULLUP); // BOOT button: HIGH = not pressed, LOW = pressed
+#if CAL_BUTTON_PIN >= 0
+    pinMode(CAL_BUTTON_PIN, INPUT_PULLUP);
 #endif
 
     // Init LCD
@@ -743,6 +790,8 @@ void setup() {
     server.on("/record", HTTP_GET, handleRecord);
     server.on("/dataset.csv", HTTP_GET, handleDatasetDownload);
     server.on("/dataset/clear", HTTP_GET, handleDatasetClear);
+    server.on("/calibrate", HTTP_GET, handleCalibrate);
+    server.on("/axis", HTTP_GET, handleAxis);
     server.on("/ping", HTTP_GET, []() {
         server.send(200, "text/plain", "pong");
     });
@@ -810,6 +859,80 @@ void triggerPrediction() {
     Serial.printf("Predict: %s value=%.3f\n", ok ? "ok" : "not-ready", v);
 }
 
+static void sortFloats(float *v, int n) {
+    for (int i = 1; i < n; i++) {
+        float key = v[i];
+        int j = i - 1;
+        while (j >= 0 && v[j] > key) {
+            v[j + 1] = v[j];
+            j--;
+        }
+        v[j + 1] = key;
+    }
+}
+
+// Axis (tilt/offset) calibration: average the fitted center line over a
+// short burst and lock it in. Point the spectrometer at a known, steady
+// light source before running this. The wavelength calibration with
+// reference peaks will be added on top of this later.
+void runAxisCalibration() {
+    gfx->fillScreen(BLACK);
+    gfx->setTextSize(1);
+    gfx->setTextColor(YELLOW);
+    gfx->setCursor(10, DISP_HEIGHT / 2);
+    gfx->println("Axis calibration...");
+    gfx->println("Point at a steady light source");
+    gfx->flush();
+
+    const int N = 20;
+    float slopes[N], intercepts[N];
+    int m = 0;
+
+    for (int i = 0; i < N; i++) {
+        camera_fb_t *fb = esp_camera_fb_get();
+        if (fb) {
+            float a = 0.0f, b = 0.0f;
+            if (fitSpectrumAxis(fb, a, b)) {
+                slopes[m] = a;
+                intercepts[m] = b;
+                m++;
+            }
+            esp_camera_fb_return(fb);
+        }
+        delay(40);
+    }
+
+    gfx->fillScreen(BLACK);
+    gfx->setTextSize(1);
+    gfx->setCursor(10, DISP_HEIGHT / 2);
+
+    if (m >= 5) {
+        sortFloats(slopes, m);
+        sortFloats(intercepts, m);
+        specSlope = slopes[m / 2];
+        specIntercept = intercepts[m / 2];
+        axisDetected = true;
+        gfx->setTextColor(GREEN);
+        gfx->printf("Axis OK\n a = %+.4f\n b = %.1f px", specSlope, specIntercept);
+        Serial.printf("Axis calib: a=%.4f b=%.1f (from %d frames)\n",
+                      specSlope, specIntercept, m);
+    } else {
+        gfx->setTextColor(RED);
+        gfx->println("Axis calibration failed");
+        gfx->println("(no spectrum detected)");
+        Serial.printf("Axis calib failed (only %d valid frames)\n", m);
+    }
+    gfx->flush();
+    delay(1500);
+
+    gfx->fillScreen(BLACK);
+    drawAxes();
+    drawColorBar();
+    drawPredictButton(false);
+    gfx->flush();
+    lastFrameTime = millis();
+}
+
 void runDarkFrame() {
     gfx->fillScreen(BLACK);
     gfx->setTextSize(1);
@@ -837,122 +960,13 @@ void runDarkFrame() {
     lastFrameTime = millis();
 }
 
-// ------------------------------------------------------------
-// CALIBRATION
-// ------------------------------------------------------------
-// Average several detected centre-line fits and lock them in. Automatic
-// tracking keeps running afterwards; this just gives a clean starting
-// point and a sanity check of the tilt/offset.
-void runCenterCalibration() {
-    gfx->fillScreen(BLACK);
-    gfx->setTextSize(1);
-    gfx->setTextColor(YELLOW);
-    gfx->setCursor(10, DISP_HEIGHT / 2 - 10);
-    gfx->println("Centre-line calibration...");
-    gfx->println("Keep the spectrum visible");
-    gfx->flush();
-
-    float sumA = 0.0f, sumB = 0.0f;
-    int ok = 0;
-    for (int i = 0; i < 10; i++) {
-        camera_fb_t *fb = esp_camera_fb_get();
-        if (fb) {
-            if (detectCenterLine(fb)) {
-                sumA += centerSlope;
-                sumB += centerOffset;
-                ok++;
-            }
-            esp_camera_fb_return(fb);
-        }
-        delay(120);
-    }
-
-    gfx->fillScreen(BLACK);
-    gfx->setTextSize(1);
-    gfx->setCursor(10, DISP_HEIGHT / 2 - 20);
-    if (ok > 0) {
-        centerSlope = sumA / (float)ok;
-        centerOffset = sumB / (float)ok;
-        centerValid = true;
-        gfx->setTextColor(GREEN);
-        gfx->printf("Centre line locked\n a = %.4f px/row\n b = %.1f px\n(%d/%d frames)\n",
-                    centerSlope, centerOffset, ok, 10);
-        Serial.printf("CENTER CAL ok=%d a=%.5f b=%.2f\n", ok, centerSlope, centerOffset);
-    } else {
-        gfx->setTextColor(RED);
-        gfx->println("Centre calibration failed");
-        gfx->println("(no spectrum detected)");
-        Serial.println("CENTER CAL failed");
-    }
-    gfx->flush();
-    delay(1500);
-
-    gfx->fillScreen(BLACK);
-    drawAxes();
-    drawColorBar();
-    drawPredictButton(false);
-    gfx->flush();
-    lastFrameTime = millis();
-}
-
-// Wavelength calibration helper. Not applied yet: it only reports the
-// strongest peaks in the current spectrum so the two known reference
-// lines (e.g. 405 / 546 nm) can be matched to sensor rows, then written
-// into CAL_PIXEL_1/2. Applying it at runtime would need the calibration
-// to become variables stored in NVS.
-void runWavelengthCalibration() {
-    if (lastSpectrumMs == 0) {
-        Serial.println("WAVELENGTH CAL: no spectrum yet");
-        return;
-    }
-
-    int idx[6];
-    float val[6];
-    int n = 0;
-
-    for (int i = 4; i < SPECTRUM_LEN - 4; i++) {
-        float v = spectrumCombined[i];
-        if (v < 25.0f) continue;
-        if (!(v > spectrumCombined[i - 1] && v >= spectrumCombined[i + 1])) continue;
-
-        bool merged = false;
-        for (int k = 0; k < n; k++) {
-            if (abs(idx[k] - i) < 12) {
-                merged = true;
-                if (v > val[k]) { idx[k] = i; val[k] = v; }
-                break;
-            }
-        }
-        if (merged) continue;
-        if (n < 6) { idx[n] = i; val[n] = v; n++; }
-    }
-
-    Serial.println("WAVELENGTH CAL - strongest peaks:");
-    if (n == 0) Serial.println("  (none above threshold)");
-    for (int k = 0; k < n; k++) {
-        Serial.printf("  row %3d  %6.1f nm  intensity %.1f\n",
-                      idx[k], pixelToNm((float)idx[k]), val[k]);
-    }
-
-    gfx->fillRect(40, 190, 240, 70, BLACK);
-    gfx->drawRect(40, 190, 240, 70, YELLOW);
-    gfx->setTextSize(1);
-    gfx->setTextColor(YELLOW);
-    gfx->setCursor(50, 200);
-    gfx->println("Wavelength cal: see serial");
-    gfx->setCursor(50, 212);
-    gfx->printf("%d peaks found", n);
-    gfx->flush();
-    delay(1500);
-}
-
-// Main button: short press = predict, long press (>= DARKFRAME_HOLD_MS)
+// BOOT button: short press = predict, long press (>= DARKFRAME_HOLD_MS)
 // = dark frame. Acting on release keeps both actions unambiguous.
-void handleMainButton() {
+void handleBootButton() {
     static bool wasPressed = false;
     static unsigned long pressStart = 0;
 
-    bool pressed = (digitalRead(BTN_MAIN_PIN) == LOW);
+    bool pressed = (digitalRead(DARKFRAME_BUTTON_PIN) == LOW);
 
     if (pressed && !wasPressed) {
         wasPressed = true;
@@ -964,22 +978,16 @@ void handleMainButton() {
     }
 }
 
-// Calibration button: short press = lock the centre line (tilt + offset),
-// long press = report the strongest peaks (wavelength calibration helper).
+// Optional third button: run axis (tilt/offset) calibration on release.
 void handleCalButton() {
-#if BTN_CAL_PIN >= 0
+#if CAL_BUTTON_PIN >= 0
     static bool wasPressed = false;
-    static unsigned long pressStart = 0;
-
-    bool pressed = (digitalRead(BTN_CAL_PIN) == LOW);
-
+    bool pressed = (digitalRead(CAL_BUTTON_PIN) == LOW);
     if (pressed && !wasPressed) {
         wasPressed = true;
-        pressStart = millis();
     } else if (!pressed && wasPressed) {
         wasPressed = false;
-        if (millis() - pressStart >= DARKFRAME_HOLD_MS) runWavelengthCalibration();
-        else runCenterCalibration();
+        runAxisCalibration();
     }
 #endif
 }
@@ -1041,7 +1049,7 @@ void loop() {
                       (unsigned)ESP.getFreeHeap());
     }
 
-    handleMainButton();
+    handleBootButton();
     handleCalButton();
     handleTouchButton();
 
@@ -1064,10 +1072,8 @@ void loop() {
         return;
     }
 
-    // Track the spectrum band (tilt + horizontal offset) on this frame
-    // before extracting, so the read-out follows the real line.
-    detectCenterLine(fb);
-
+    // Follow the (possibly tilted) spectrum band before sampling it.
+    updateSpectrumAxis(fb);
     extractSpectrum(fb, spectrumRawR, spectrumRawG, spectrumRawB);
     esp_camera_fb_return(fb);
 

@@ -46,198 +46,167 @@ float spectrumTemporalB[TEMPORAL_FRAMES][SPECTRUM_LEN];
 uint8_t temporalIndex = 0;
 uint8_t temporalCount = 0; // how many real frames have been fed in so far (<= TEMPORAL_FRAMES)
 
-// ---------------- Dynamic centre-line tracking ----------------
-// The dispersed spectrum is not perfectly vertical: it has an angular
-// offset (tilt) and a horizontal offset that can change between setups.
-// We model the centre of the band as
-//     x(y) = a * y + b
-// find the brightest column of each sampled row, and fit the line by
-// least squares with one outlier-rejection pass. Extraction then follows
-// that line instead of a fixed CENTER_COL, so the measured intensity
-// always comes from the real spectrum band.
-//
-// a is in pixels per row (~0 = vertical). b is the column at row 0.
+// ---------------- Auto center-line (tilt) detection ----------------
+// The spectrum is a bright band, but in the real camera image it is
+// usually tilted and shifted. Instead of a fixed column we fit
+//   x(y) = a * y + b
+// to the bright band and use that line for extraction, so the yellow
+// overlay on the web page and the sampled data always match the light.
+float specSlope = 0.0f;             // a (pixels per row)
+float specIntercept = (float)CENTER_COL; // b (column at row 0)
+bool  axisDetected = false;
 
-#define CENTER_ROW_STEP   2
-#define CENTER_MAX_POINTS (FRAME_HEIGHT / CENTER_ROW_STEP + 2)
-#define CENTER_TRACK_HALF 60      // search half-width once the line is known
-#define CENTER_MIN_ROWS   40      // minimum rows needed for a fit
-#define CENTER_MAX_SLOPE  0.8f    // |a| sanity limit
-#define CENTER_EMA_ALPHA  0.30f   // temporal smoothing of a and b
+#ifndef AXIS_AUTO_DETECT
+#define AXIS_AUTO_DETECT 1
+#endif
+#define AXIS_ROW_STEP     4      // sample every Nth row
+#define AXIS_COL_STEP     4      // sample every Nth column
+#define AXIS_MIN_ROWS     40     // need this many valid rows to trust a fit
+#define AXIS_MAX_SLOPE    0.30f  // reject absurd tilts (px per row)
+#define AXIS_EMA_ALPHA    0.25f  // smoothing between frames
+#define AXIS_MIN_BRIGHT   12     // ignore rows darker than this (0-255)
 
-float centerSlope  = 0.0f;               // a, pixels per row
-float centerOffset = (float)CENTER_COL;  // b, column at row 0
-bool  centerValid  = false;              // true once a fit succeeded
-float centerConfidence = 0.0f;           // inlier rows / sampled rows
-
-static inline float centerLuma(uint16_t p) {
-    float r = (p >> 11) & 0x1F;
-    float g = (p >> 5) & 0x3F;
-    float b = p & 0x1F;
-    r = r * (255.0f / 31.0f);
-    g = g * (255.0f / 63.0f);
-    b = b * (255.0f / 31.0f);
-    return 0.2126f * r + 0.7152f * g + 0.0722f * b;
+static inline uint8_t pixelLuma(uint16_t p) {
+    uint8_t r = (p >> 11) & 0x1F;
+    uint8_t g = (p >> 5) & 0x3F;
+    uint8_t b = p & 0x1F;
+    r = (r << 3) | (r >> 2);
+    g = (g << 2) | (g >> 4);
+    b = (b << 3) | (b >> 2);
+    return (uint8_t)(0.2126f * r + 0.7152f * g + 0.0722f * b);
 }
 
-// Centre column used for a given sensor row (clamped so the +/- averaging
-// window always stays inside the frame).
-int centerColumnForRow(int row) {
-    float c = centerValid ? (centerSlope * (float)row + centerOffset)
-                          : (float)CENTER_COL;
-    int ic = (int)(c + 0.5f);
-    if (ic < COL_AVG_RANGE) ic = COL_AVG_RANGE;
-    if (ic > FRAME_WIDTH - 1 - COL_AVG_RANGE) ic = FRAME_WIDTH - 1 - COL_AVG_RANGE;
-    return ic;
-}
-
-// Fit x = a*y + b on the detected row maxima. Returns false when the
-// frame does not contain a usable spectrum line (dark frame, no light).
-bool detectCenterLine(camera_fb_t *fb) {
+// Fit x = a*y + b to the brightest band of one frame.
+// Returns false when there is not enough light / too few valid rows.
+bool fitSpectrumAxis(camera_fb_t *fb, float &outA, float &outB) {
     const uint16_t *pix = (const uint16_t *)fb->buf;
-    static float sy[CENTER_MAX_POINTS];
-    static float sx[CENTER_MAX_POINTS];
-    static float sm[CENTER_MAX_POINTS];
-    static float ssort[CENTER_MAX_POINTS];
+    const int maxPts = FRAME_HEIGHT / AXIS_ROW_STEP + 1;
+    static int16_t ptsY[maxPts];
+    static int16_t ptsX[maxPts];
     int n = 0;
 
-    const int half = centerValid ? CENTER_TRACK_HALF : (FRAME_WIDTH / 2 - 1);
+    // Coarse global peak so a mostly-dark frame (e.g. dark capture) does
+    // not produce a fit from sensor noise.
+    uint8_t globalPeak = 0;
+    for (int y = 0; y < FRAME_HEIGHT; y += 8) {
+        const uint16_t *row = pix + (size_t)y * FRAME_WIDTH;
+        for (int x = 0; x < FRAME_WIDTH; x += 8) {
+            uint8_t v = pixelLuma(row[x]);
+            if (v > globalPeak) globalPeak = v;
+        }
+    }
+    int rowThr = globalPeak / 4;
+    if (rowThr < AXIS_MIN_BRIGHT) rowThr = AXIS_MIN_BRIGHT;
 
-    for (int y = 0; y < FRAME_HEIGHT; y += CENTER_ROW_STEP) {
-        float pred = centerValid ? (centerSlope * (float)y + centerOffset)
-                                 : (float)CENTER_COL;
-        int x0 = (int)pred - half;
-        int x1 = (int)pred + half;
-        if (x0 < 1) x0 = 1;
-        if (x1 > FRAME_WIDTH - 2) x1 = FRAME_WIDTH - 2;
-        if (x1 <= x0) continue;
-
+    for (int y = 0; y < FRAME_HEIGHT; y += AXIS_ROW_STEP) {
         const uint16_t *row = pix + (size_t)y * FRAME_WIDTH;
 
-        // 3-column box filter rejects single hot pixels.
-        float best = -1.0f;
-        int bestX = x0;
-        for (int x = x0; x <= x1; x++) {
-            float v = centerLuma(row[x - 1]) + centerLuma(row[x]) + centerLuma(row[x + 1]);
-            if (v > best) { best = v; bestX = x; }
+        uint8_t peak = 0;
+        for (int x = 0; x < FRAME_WIDTH; x += AXIS_COL_STEP) {
+            uint8_t v = pixelLuma(row[x]);
+            if (v > peak) peak = v;
         }
-        if (best <= 0.0f) continue;
+        if (peak < rowThr) continue;
 
-        // Sub-pixel refinement: intensity centroid of the whole bright
-        // band in this row (not just around the peak), so a wide stripe
-        // still yields its true centre.
-        float cut = best * 0.5f;
-        float num = 0.0f, den = 0.0f;
-        for (int x = x0; x <= x1; x++) {
-            float v = centerLuma(row[x - 1]) + centerLuma(row[x]) + centerLuma(row[x + 1]);
-            if (v < cut) continue;
-            num += v * (float)x;
-            den += v;
+        // Weighted centroid of the pixels near this row's peak.
+        const float thr = peak * 0.6f;
+        float wsum = 0.0f, xsum = 0.0f;
+        for (int x = 0; x < FRAME_WIDTH; x += AXIS_COL_STEP) {
+            uint8_t v = pixelLuma(row[x]);
+            if (v >= thr) {
+                float w = (float)v - thr + 1.0f;
+                wsum += w;
+                xsum += w * (float)x;
+            }
         }
-        float cx = (den > 1.0f) ? (num / den) : (float)bestX;
+        if (wsum <= 0.0f) continue;
 
-        sy[n] = (float)y;
-        sx[n] = cx;
-        sm[n] = best / 3.0f; // mean luma of the 3-column window
+        ptsY[n] = (int16_t)y;
+        ptsX[n] = (int16_t)(xsum / wsum);
         n++;
     }
 
-    if (n < CENTER_MIN_ROWS) return false;
+    if (n < AXIS_MIN_ROWS) return false;
 
-    // Median brightness keeps dark rows out of the fit.
-    for (int i = 0; i < n; i++) ssort[i] = sm[i];
-    for (int i = 1; i < n; i++) {
-        float key = ssort[i];
-        int j = i - 1;
-        while (j >= 0 && ssort[j] > key) { ssort[j + 1] = ssort[j]; j--; }
-        ssort[j + 1] = key;
+    // Least squares, then one outlier-rejection pass and refit.
+    float a = 0.0f, b = 0.0f;
+    for (int pass = 0; pass < 2; pass++) {
+        float sumY = 0, sumX = 0, sumYY = 0, sumXY = 0;
+        int used = 0;
+        float meanAbsRes = 0.0f;
+
+        for (int i = 0; i < n; i++) {
+            if (pass == 1) {
+                float pred = a * ptsY[i] + b;
+                if (fabsf(ptsX[i] - pred) > meanAbsRes) continue;
+            }
+            sumY += ptsY[i];
+            sumX += ptsX[i];
+            sumYY += (float)ptsY[i] * ptsY[i];
+            sumXY += (float)ptsY[i] * ptsX[i];
+            used++;
+        }
+        if (used < AXIS_MIN_ROWS) return false;
+
+        float denom = used * sumYY - sumY * sumY;
+        if (fabsf(denom) < 1e-6f) return false;
+        a = (used * sumXY - sumY * sumX) / denom;
+        b = (sumX - a * sumY) / used;
+
+        if (pass == 0) {
+            // Threshold for the rejection pass: 2x mean residual.
+            float sum = 0.0f;
+            for (int i = 0; i < n; i++) sum += fabsf(ptsX[i] - (a * ptsY[i] + b));
+            meanAbsRes = 2.0f * (sum / n) + 1.0f;
+        }
     }
-    float threshold = ssort[n / 2] * 0.45f;
-    if (threshold < 6.0f) threshold = 6.0f;
-
-    // First least-squares fit.
-    float Sx = 0, Sy = 0, Sxx = 0, Sxy = 0;
-    int m = 0;
-    for (int i = 0; i < n; i++) {
-        if (sm[i] < threshold) continue;
-        Sx += sy[i];
-        Sy += sx[i];
-        Sxx += sy[i] * sy[i];
-        Sxy += sy[i] * sx[i];
-        m++;
-    }
-    if (m < CENTER_MIN_ROWS) return false;
-
-    float denom = (float)m * Sxx - Sx * Sx;
-    if (fabsf(denom) < 1e-3f) return false;
-    float a = ((float)m * Sxy - Sx * Sy) / denom;
-    float b = (Sy - a * Sx) / (float)m;
-
-    // One outlier-rejection pass.
-    float rsum = 0, rsum2 = 0;
-    int rn = 0;
-    for (int i = 0; i < n; i++) {
-        if (sm[i] < threshold) continue;
-        float r = sx[i] - (a * sy[i] + b);
-        rsum += r;
-        rsum2 += r * r;
-        rn++;
-    }
-    float rmean = (rn > 0) ? (rsum / rn) : 0.0f;
-    float rvar = (rn > 0) ? (rsum2 / rn - rmean * rmean) : 0.0f;
-    float rstd = (rvar > 0.0f) ? sqrtf(rvar) : 0.0f;
-    float limit = (rstd > 0.5f) ? (2.5f * rstd) : 2.0f;
-
-    Sx = Sy = Sxx = Sxy = 0;
-    m = 0;
-    for (int i = 0; i < n; i++) {
-        if (sm[i] < threshold) continue;
-        float r = sx[i] - (a * sy[i] + b);
-        if (fabsf(r - rmean) > limit) continue;
-        Sx += sy[i];
-        Sy += sx[i];
-        Sxx += sy[i] * sy[i];
-        Sxy += sy[i] * sx[i];
-        m++;
-    }
-    if (m < CENTER_MIN_ROWS) return false;
-
-    denom = (float)m * Sxx - Sx * Sx;
-    if (fabsf(denom) < 1e-3f) return false;
-    a = ((float)m * Sxy - Sx * Sy) / denom;
-    b = (Sy - a * Sx) / (float)m;
 
     if (!isfinite(a) || !isfinite(b)) return false;
-    if (fabsf(a) > CENTER_MAX_SLOPE) return false;
-    if (b < -(float)FRAME_WIDTH || b > 2.0f * (float)FRAME_WIDTH) return false;
+    if (fabsf(a) > AXIS_MAX_SLOPE) return false;
 
-    centerConfidence = (float)m / (float)n;
-
-    if (!centerValid) {
-        centerSlope = a;
-        centerOffset = b;
-        centerValid = true;
-    } else {
-        centerSlope  = (1.0f - CENTER_EMA_ALPHA) * centerSlope  + CENTER_EMA_ALPHA * a;
-        centerOffset = (1.0f - CENTER_EMA_ALPHA) * centerOffset + CENTER_EMA_ALPHA * b;
-    }
+    outA = a;
+    outB = b;
     return true;
 }
 
+// Per-frame update with exponential smoothing. Keeps the previous line
+// when the frame has no usable signal.
+bool updateSpectrumAxis(camera_fb_t *fb) {
+#if AXIS_AUTO_DETECT
+    float a = 0.0f, b = 0.0f;
+    if (!fitSpectrumAxis(fb, a, b)) return false;
+
+    if (!axisDetected) {
+        specSlope = a;
+        specIntercept = b;
+        axisDetected = true;
+    } else {
+        specSlope += AXIS_EMA_ALPHA * (a - specSlope);
+        specIntercept += AXIS_EMA_ALPHA * (b - specIntercept);
+    }
+    return true;
+#else
+    (void)fb;
+    return false;
+#endif
+}
+
 // ---------------- Extraction ----------------
-// Reads the tracked centre column (averaged over +/- COL_AVG_RANGE
-// columns) down every row -> one R/G/B value per row (vertical spectrum).
+// Reads along the fitted center line x(y) = a*y + b (averaged over
+// +/- COL_AVG_RANGE columns) down every row -> one R/G/B value per row
+// (vertical spectrum).
 // The spectrum is indexed by row: index 0 = top of the sensor image.
 // Values are NOT clamped or combined here - raw per-channel averages.
 // Set SPECTRUM_INVERT to 1 if the spectrum appears reversed (e.g. red at
 // the top instead of the bottom) so the graph reads low->high wavelength.
 void extractSpectrum(camera_fb_t *fb, float *outR, float *outG, float *outB) {
-    const int numCols = COL_AVG_RANGE * 2 + 1;
-
     for (int row = 0; row < FRAME_HEIGHT; row++) {
-        int center = centerColumnForRow(row);
+        int center = (int)(specSlope * (float)row + specIntercept + 0.5f);
         int colStart = center - COL_AVG_RANGE;
         int colEnd = center + COL_AVG_RANGE;
+        if (colStart < 0) colStart = 0;
+        if (colEnd >= FRAME_WIDTH) colEnd = FRAME_WIDTH - 1;
+        int numCols = colEnd - colStart + 1;
 
         uint32_t rSum = 0, gSum = 0, bSum = 0;
         for (int col = colStart; col <= colEnd; col++) {

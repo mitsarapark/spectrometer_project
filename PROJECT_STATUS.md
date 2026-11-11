@@ -37,8 +37,6 @@ Camera (RGB565 VGA 640x480)
 
 - [x] อ่านภาพจากกล้อง RGB565 VGA
 - [x] ดึงสเปกตรัมจากคอลัมน์กลาง (แนวตั้ง) ± ช่วงเฉลี่ย
-- [x] Dynamic center tracking: fit x(y)=a*y+b (least squares + outlier rejection) แล้วอ่านค่าตามแนวจริง ลดผลจากความเอียง/เลื่อน
-- [x] ปุ่ม calibrate: center-line calibration + รายงาน peak สำหรับ wavelength calibration
 - [x] Dark frame capture (BOOT ค้าง) + แสดงสถานะบนจอ
 - [x] Temporal averaging + moving average
 - [x] แยก R/G/B ตลอด pipeline แล้วรวมเป็น Rec.709 เพื่อแสดงผล/บันทึก
@@ -50,6 +48,8 @@ Camera (RGB565 VGA 640x480)
 - [x] PLSR training pipeline (`ml/`) + data augmentation + export header
 - [x] On-device inference (dot product) + แสดงผลบน LCD และเว็บ
 - [x] ปุ่ม PREDICT บนจอ (touch) + BOOT สำรอง
+- [x] Auto center-line: fit `x(y)=a*y+b` ตามแนวสเปกตรัม (แก้ tilt/offset) + overlay เอียงตามจริงบนเว็บ
+- [x] Axis calibration (ปุ่มที่สามหรือ `/calibrate`) สำหรับล็อกแนว/ความเอียง
 - [x] Captive portal + mDNS (`http://spectrometer.local`) เข้าเว็บได้ทันทีหลังต่อ WiFi
 - [x] `SPECTRUM_INVERT` สำหรับกลับลำดับ row
 - [x] รีเฟรชทุก 300 ms (`FRAME_INTERVAL_MS`)
@@ -58,13 +58,12 @@ Camera (RGB565 VGA 640x480)
 
 | ค่า | ปัจจุบัน | หมายเหตุ |
 |---|---|---|
-| `CENTER_COL` | 320 | fallback เมื่อยังตรวจจับแนวไม่ได้ |
-| `COL_AVG_RANGE` | 10 | เฉลี่ย ±10 คอลัมน์รอบแนวที่ตรวจพบ |
-| `CENTER_ROW_STEP` | 2 | สุ่มแถวทุก 2 แถวเพื่อ fit เส้น |
-| `CENTER_TRACK_HALF` | 60 | ช่วงค้นหา ±px หลังรู้แนวแล้ว |
-| `CENTER_EMA_ALPHA` | 0.30 | smoothing ของ a, b |
-| `BTN_MAIN_PIN` | 0 | กดสั้น = predict, กดค้าง = dark frame |
-| `BTN_CAL_PIN` | -1 | กดสั้น = center cal, กดค้าง = peak report |
+| `CENTER_COL` | 320 | fallback เมื่อยัง detect แนวไม่ได้ |
+| `AXIS_AUTO_DETECT` | 1 | เปิด auto tilt/offset detection |
+| `AXIS_MAX_SLOPE` | 0.30 | จำกัดความเอียงสูงสุด (px/row) |
+| `AXIS_EMA_ALPHA` | 0.25 | ความลื่นของเส้นแนวสเปกตรัม |
+| `CAL_BUTTON_PIN` | -1 | ปุ่มที่สามสำหรับ axis calibration (ตั้ง GPIO เมื่อต่อปุ่ม) |
+| `COL_AVG_RANGE` | 10 | เฉลี่ย ±10 คอลัมน์ |
 | `SPECTRUM_LEN` | 480 | = FRAME_HEIGHT |
 | `SPECTRUM_INVERT` | 0 | ตั้ง 1 ถ้าสเปกตรัมกลับหัว |
 | `TEMPORAL_FRAMES` | 4 | จำนวนเฟรมเฉลี่ย |
