@@ -123,12 +123,14 @@ bool detectCenterLine(camera_fb_t *fb) {
         }
         if (best <= 0.0f) continue;
 
-        // Sub-pixel refinement by intensity centroid.
-        int rx0 = bestX - 4; if (rx0 < 0) rx0 = 0;
-        int rx1 = bestX + 4; if (rx1 > FRAME_WIDTH - 1) rx1 = FRAME_WIDTH - 1;
+        // Sub-pixel refinement: intensity centroid of the whole bright
+        // band in this row (not just around the peak), so a wide stripe
+        // still yields its true centre.
+        float cut = best * 0.5f;
         float num = 0.0f, den = 0.0f;
-        for (int x = rx0; x <= rx1; x++) {
-            float v = centerLuma(row[x]);
+        for (int x = x0; x <= x1; x++) {
+            float v = centerLuma(row[x - 1]) + centerLuma(row[x]) + centerLuma(row[x + 1]);
+            if (v < cut) continue;
             num += v * (float)x;
             den += v;
         }
