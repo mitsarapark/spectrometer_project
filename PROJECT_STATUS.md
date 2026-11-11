@@ -55,6 +55,7 @@ Camera (RGB565 VGA 640x480)
 - [x] Captive portal + mDNS (`http://spectrometer.local`) เข้าเว็บได้ทันทีหลังต่อ WiFi
 - [x] Serial commands: `c` (axis calibrate), `a` (auto align), `d` (dark frame), `p` (predict)
 - [x] แยกแสงหักเหข้างแถบหลักออกด้วย half-max midpoint + prediction window (±`AXIS_PRED_WIN`)
+- [x] `fitSpectrumAxis()` ใช้ shear projection (fit เส้นตรงทั้งภาพ: ลองความชัน `a` แล้วเลือกที่ profile คมสุด) + refine รายแถว; ถ้าไม่เจอจะ fallback ไปวิธี walk เดิม (ทดสอบ offline กับเฟรมสังเคราะห์แล้ว ยังไม่ได้ทดสอบบนบอร์ด)
 - [x] `SPECTRUM_INVERT` สำหรับกลับลำดับ row
 - [x] รีเฟรชทุก 300 ms (`FRAME_INTERVAL_MS`)
 
