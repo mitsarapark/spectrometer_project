@@ -30,7 +30,7 @@
 - captive portal (เด้งหน้าเว็บเองหลังต่อ WiFi) + mDNS `http://spectrometer.local`
 - dark frame (BOOT ค้าง), temporal/moving average, Rec.709 combine
 - 2-point wavelength calibration (ค่า default 380–700 nm)
-- auto center-line: fit `x(y)=a*y+b` แบบ track แถบหลัก + overlay เอียงบนเว็บ
+- auto center-line: fit `x(y)=a*y+b` ตามแถบหลัก, **lock + NVS** (ไม่มี auto-track), เส้นเหลืองฝังในภาพ `/capture` จากเฟรมเดียวกัน
 - axis calibration (`/calibrate`, ปุ่มที่สามถ้าต่อ, serial `c`)
 - dataset CSV ลง LittleFS **หรือ** FFat (เลือกตาม partition อัตโนมัติ) + ดาวน์โหลด/ล้าง
 - PLSR training pipeline (`ml/`) + on-device dot-product inference
@@ -101,7 +101,7 @@ BOOT     : GPIO0 (INPUT_PULLUP, active LOW)
 
 ```
 esp_camera_fb_get() [RGB565 VGA 640x480]
-  -> updateSpectrumAxis(fb)   track แถบสเปกตรัม + fit x(y)=a*y+b (EMA)
+  -> updateSpectrumAxis(fb)   no-op เมื่อ locked / AXIS_AUTO_DETECT=0 (แนวไม่ขยับเอง)
   -> extractSpectrum(fb)      อ่านตามแนว x(y) ± COL_AVG_RANGE -> R/G/B ต่อ row
   -> applyDarkFrameSubtraction()
   -> applyTemporalAverage()   4 เฟรม
@@ -151,19 +151,20 @@ Axis detection (`spectrum_processing.h`):
 
 | Macro | ค่า | ความหมาย |
 |---|---|---|
-| `AXIS_AUTO_DETECT` | 1 | เปิด auto center-line |
-| `AXIS_ROW_STEP` | 4 | track ทุก 4 แถว |
+| `AXIS_AUTO_DETECT` | **0** | 0 = เส้นขยับเฉพาะตอนสั่ง calibrate (ตั้งใน `spectrometer.ino`) |
+| `AXIS_ROW_STEP` | 4 | sample ทุก 4 แถว |
 | `AXIS_MIN_ROWS` | 40 | จำนวนจุดขั้นต่ำที่เชื่อถือ |
 | `AXIS_MAX_SLOPE` | 0.30 | |a| สูงสุด (px/row) |
-| `AXIS_EMA_ALPHA` | 0.25 | ความลื่นระหว่างเฟรม |
+| `AXIS_EMA_ALPHA` | 0.25 | ความลื่นระหว่างเฟรม (โหมด auto เท่านั้น) |
 | `AXIS_MIN_BRIGHT` | 12 | กัน noise ในเฟรมมืด |
-| `AXIS_TRACK_WIN` | 30 | หน้าต่างค้นหา ±px รอบแถวก่อนหน้า |
-| `AXIS_REFINE_WIN` | 8 | หน้าต่าง centroid รอบ peak |
-| `AXIS_PEAK_FRACTION` | 0.5 | row peak ต้อง ≥ ครึ่งของ frame peak |
+| `AXIS_PRED_WIN` | 24 | หน้าต่างค้นหา ±px รอบตำแหน่งที่ทำนาย |
+| `AXIS_SELECT_FRACTION` | 0.80 | เลือก peak ที่ใกล้ prediction ถ้าความสว่าง ≥ 80% ของ peak ในหน้าต่าง |
+| `AXIS_PEAK_FRACTION` | 0.35 | row peak ต้อง ≥ 35% ของ frame peak |
+| `AXIS_INLIER_PX` | 3.0 | เกณฑ์ outlier ของ robust fit |
 
-**Axis lock**: `/calibrate` (หรือปุ่มที่สาม/serial `c`) จะ fit 20 เฟรม → median `a`,`b` แล้ว **ล็อก**
-(`axisLocked = true`) ทำให้ `updateSpectrumAxis()` หยุด track จนกว่าจะปล่อยด้วย serial `a` หรือ `/axis/auto`
-(หรือ reboot) — ค่า lock ไม่ได้เก็บลง NVS
+**Axis calibration**: `/calibrate`, ปุ่มที่สาม หรือ serial `c` → fit 20 เฟรม → median `a`,`b` → **lock + บันทึก NVS**
+(`Preferences` namespace `axis`) ค่าจึงคงอยู่ข้าม reboot และไม่มี auto-tracking มาเขียนทับ
+`/axis/auto` หรือ serial `a` = fit เฟรมเดียวแล้ว lock (one-shot, ไม่รันเอง)
 
 ---
 
@@ -179,7 +180,7 @@ Axis detection (`spectrum_processing.h`):
 | `/dataset/clear` | ล้าง dataset |
 | `/calibrate` | เก็บ 20 เฟรม → median `a`,`b` แล้ว **lock** แนว (คืน `ok`,`locked`) |
 | `/axis` | `{"a":..,"b":..,"detected":..,"locked":..}` |
-| `/axis/auto` | ปลดล็อก กลับไป auto tracking |
+| `/axis/auto` | fit เฟรมเดียวแล้ว lock + บันทึก NVS (one-shot) |
 | `/ping` | `pong` (ทดสอบเร็ว) |
 
 อื่น ๆ: captive portal redirect ทุก path ที่ไม่รู้จัก, `[443]` probe log เมื่อ browser ใช้ HTTPS
@@ -195,7 +196,7 @@ Axis detection (`spectrum_processing.h`):
 | `CAL_BUTTON_PIN` (ถ้าตั้ง) | axis calibration (lock แนว) |
 | Touch ปุ่ม PREDICT บนจอ | predict (ถ้า touch เจอ) |
 | Serial `c` | axis calibration (lock แนว) |
-| Serial `a` | ปลด lock กลับไป auto tracking |
+| Serial `a` | auto align ครั้งเดียว (fit + lock + NVS) |
 | Serial `d` | dark frame |
 | Serial `p` | predict |
 
@@ -244,9 +245,10 @@ Web server started on port 80
 Open: http://192.168.4.1/   (no port needed, HTTP/80)
 FAT partition 'ffat' at 0x...... , xxxx KB
 Dataset ready: N samples in /dataset.csv
-Touch 0x3B: not found (use BOOT button)
+Touch 0x3B: found
+Axis loaded from NVS: a=... b=... (locked)
 Setup complete. Starting capture...
-Serial commands: c=axis calibrate, d=dark frame, p=predict
+Serial commands: c=axis calibrate (locks), d=dark frame, p=predict, a=auto align
 [hb] up=..s stations=.. heap=..
 ```
 
@@ -255,7 +257,7 @@ Serial commands: c=axis calibrate, d=dark frame, p=predict
 |---|---|
 | เปิดเว็บไม่ได้ | `[ap] client connected` มีไหม, `GET /` มีไหม, `[443]` ขึ้นไหม (browser ใช้ https) |
 | บอร์ดรีบูต | `Stack canary` / panic → ดู P8 ใน `problem.md` |
-| เส้นเหลืองไม่ทับแถบ | `/axis` (`detected`), ปรับ `AXIS_PEAK_FRACTION` / `AXIS_TRACK_WIN` |
+| เส้นเหลืองไม่ทับแถบ | `/axis` (`detected`,`locked`), กด **Calibrate axis** / **Auto align** ใหม่, ดู `AXIS_PEAK_FRACTION` / `AXIS_PRED_WIN` |
 | dataset ไม่ขึ้น | log partition backend (LittleFS/FFat) |
 | ค่า intensity ต่ำ | ตรวจ `a`,`b` ว่าตรงแนว, tune exposure |
 
@@ -322,3 +324,5 @@ Serial commands: c=axis calibrate, d=dark frame, p=predict
 | `9687e08` | แก้ scope bug ของ axis fit |
 | `3d13bab` | เปลี่ยนเป็น track แถบหลัก (กันแสงหักเหข้าง ๆ) |
 | `68ccbcd` | lock แนวเมื่อ calibrate + ย้าย touch ไป I2C 8/7 ด้วย BSP driver |
+| `177c733` | vendor Waveshare AXS15231B touch driver ใน sketch folder |
+| `b6cdeeb` | calibrate แบบ manual เท่านั้น + NVS, fit half-max midpoint, เส้นเหลืองฝังใน /capture |

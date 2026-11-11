@@ -49,11 +49,12 @@ Camera (RGB565 VGA 640x480)
 - [x] PLSR training pipeline (`ml/`) + data augmentation + export header
 - [x] On-device inference (dot product) + แสดงผลบน LCD และเว็บ
 - [x] ปุ่ม PREDICT บนจอ (touch) + BOOT สำรอง
-- [x] Auto center-line: fit `x(y)=a*y+b` ตามแนวสเปกตรัม (แก้ tilt/offset) + overlay เอียงตามจริงบนเว็บ
-- [x] Axis calibration (ปุ่มที่สามหรือ `/calibrate`) → **lock แนวถาวรจนกว่าจะปลด** (`/axis/auto` หรือ serial `a`)
+- [x] Auto center-line: fit `x(y)=a*y+b` ตามแนวสเปกตรัม (แก้ tilt/offset), **ไม่ track เอง** — ขยับเฉพาะตอน calibrate
+- [x] Axis calibration (ปุ่มที่สาม/`/calibrate`/serial `c`) → **lock + เก็บ NVS**, `/axis/auto` = fit เฟรมเดียวแล้ว lock
+- [x] เส้นเหลืองฝังในภาพ `/capture` จากเฟรมเดียวกับที่วัด (ไม่มี overlay ล่าช้าบนเว็บ)
 - [x] Captive portal + mDNS (`http://spectrometer.local`) เข้าเว็บได้ทันทีหลังต่อ WiFi
-- [x] Serial commands: `c` (axis calibrate), `d` (dark frame), `p` (predict)
-- [x] แยกแสงหักเหข้างแถบหลักออกด้วย tracking window (±`AXIS_TRACK_WIN`)
+- [x] Serial commands: `c` (axis calibrate), `a` (auto align), `d` (dark frame), `p` (predict)
+- [x] แยกแสงหักเหข้างแถบหลักออกด้วย half-max midpoint + prediction window (±`AXIS_PRED_WIN`)
 - [x] `SPECTRUM_INVERT` สำหรับกลับลำดับ row
 - [x] รีเฟรชทุก 300 ms (`FRAME_INTERVAL_MS`)
 
@@ -62,12 +63,12 @@ Camera (RGB565 VGA 640x480)
 | ค่า | ปัจจุบัน | หมายเหตุ |
 |---|---|---|
 | `CENTER_COL` | 320 | fallback เมื่อยัง detect แนวไม่ได้ |
-| `AXIS_AUTO_DETECT` | 1 | เปิด auto tilt/offset detection |
+| `AXIS_AUTO_DETECT` | 0 | 0 = เส้นขยับเฉพาะตอน calibrate |
 | `AXIS_MAX_SLOPE` | 0.30 | จำกัดความเอียงสูงสุด (px/row) |
-| `AXIS_EMA_ALPHA` | 0.25 | ความลื่นของเส้นแนวสเปกตรัม |
-| `AXIS_TRACK_WIN` | 30 px | หน้าต่าง track รอบแถวก่อนหน้า |
-| `AXIS_REFINE_WIN` | 8 px | หน้าต่าง centroid รอบ peak |
-| `AXIS_PEAK_FRACTION` | 0.5 | row peak ต้อง ≥ ครึ่งของ frame peak |
+| `AXIS_EMA_ALPHA` | 0.25 | ความลื่นของเส้นแนวสเปกตรัม (โหมด auto) |
+| `AXIS_PRED_WIN` | 24 px | หน้าต่างค้นหารอบตำแหน่งที่ทำนาย |
+| `AXIS_SELECT_FRACTION` | 0.80 | กันการกระโดดไป order ข้างเคียง |
+| `AXIS_PEAK_FRACTION` | 0.35 | row peak ต้อง ≥ 35% ของ frame peak |
 | `DARKFRAME_BUTTON_PIN` | 0 | ปุ่ม action (สั้น=predict, ค้าง=dark) |
 | `CAL_BUTTON_PIN` | -1 | ปุ่มที่สามสำหรับ axis calibration (ตั้ง GPIO เมื่อต่อปุ่ม) |
 | `COL_AVG_RANGE` | 10 | เฉลี่ย ±10 คอลัมน์ |
@@ -121,7 +122,7 @@ python train_plsr.py --csv dataset.csv --unit "%"
 
 - ค่า calibration เริ่มต้น map เต็มคอลัมน์เป็น 380–700 nm — ควรวัด 405/546 nm จากหลอด fluorescent จริงแล้วแก้ `CAL_*`
 - Touch: ย้ายไป bus **8/7 + Waveshare BSP** (`bsp_touch_init`) แล้ว — รอทดสอบบนฮาร์ดแวร์จริง
-- Axis lock (จาก `/calibrate`) ไม่เก็บลง NVS → reboot แล้วกลับไป auto tracking; ถ้าต้องการค่าคงที่ต้อง calibrate ใหม่ทุกครั้งที่บูต
+- Axis calibration เก็บใน NVS (`Preferences` namespace `axis`) → คงอยู่ข้าม reboot; ถ้าย้ายแท่น/เปลี่ยนแสงต้อง calibrate ใหม่
 - **ปุ่มกายภาพยังไม่ผูกครบ**: `DARKFRAME_BUTTON_PIN = 0` (BOOT) และ `CAL_BUTTON_PIN = -1`; ต้องตั้งเมื่อรู้ GPIO จริง
 - ใช้ `/calibrate` หรือ serial `c` แทนปุ่ม calibrate ได้
 - `/capture` ดึงเฟรมใหม่แยกจาก loop → บางรอบ measurement frame ถูกใช้ไป
