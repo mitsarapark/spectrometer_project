@@ -46,21 +46,197 @@ float spectrumTemporalB[TEMPORAL_FRAMES][SPECTRUM_LEN];
 uint8_t temporalIndex = 0;
 uint8_t temporalCount = 0; // how many real frames have been fed in so far (<= TEMPORAL_FRAMES)
 
+// ---------------- Dynamic centre-line tracking ----------------
+// The dispersed spectrum is not perfectly vertical: it has an angular
+// offset (tilt) and a horizontal offset that can change between setups.
+// We model the centre of the band as
+//     x(y) = a * y + b
+// find the brightest column of each sampled row, and fit the line by
+// least squares with one outlier-rejection pass. Extraction then follows
+// that line instead of a fixed CENTER_COL, so the measured intensity
+// always comes from the real spectrum band.
+//
+// a is in pixels per row (~0 = vertical). b is the column at row 0.
+
+#define CENTER_ROW_STEP   2
+#define CENTER_MAX_POINTS (FRAME_HEIGHT / CENTER_ROW_STEP + 2)
+#define CENTER_TRACK_HALF 60      // search half-width once the line is known
+#define CENTER_MIN_ROWS   40      // minimum rows needed for a fit
+#define CENTER_MAX_SLOPE  0.8f    // |a| sanity limit
+#define CENTER_EMA_ALPHA  0.30f   // temporal smoothing of a and b
+
+float centerSlope  = 0.0f;               // a, pixels per row
+float centerOffset = (float)CENTER_COL;  // b, column at row 0
+bool  centerValid  = false;              // true once a fit succeeded
+float centerConfidence = 0.0f;           // inlier rows / sampled rows
+
+static inline float centerLuma(uint16_t p) {
+    float r = (p >> 11) & 0x1F;
+    float g = (p >> 5) & 0x3F;
+    float b = p & 0x1F;
+    r = r * (255.0f / 31.0f);
+    g = g * (255.0f / 63.0f);
+    b = b * (255.0f / 31.0f);
+    return 0.2126f * r + 0.7152f * g + 0.0722f * b;
+}
+
+// Centre column used for a given sensor row (clamped so the +/- averaging
+// window always stays inside the frame).
+int centerColumnForRow(int row) {
+    float c = centerValid ? (centerSlope * (float)row + centerOffset)
+                          : (float)CENTER_COL;
+    int ic = (int)(c + 0.5f);
+    if (ic < COL_AVG_RANGE) ic = COL_AVG_RANGE;
+    if (ic > FRAME_WIDTH - 1 - COL_AVG_RANGE) ic = FRAME_WIDTH - 1 - COL_AVG_RANGE;
+    return ic;
+}
+
+// Fit x = a*y + b on the detected row maxima. Returns false when the
+// frame does not contain a usable spectrum line (dark frame, no light).
+bool detectCenterLine(camera_fb_t *fb) {
+    const uint16_t *pix = (const uint16_t *)fb->buf;
+    static float sy[CENTER_MAX_POINTS];
+    static float sx[CENTER_MAX_POINTS];
+    static float sm[CENTER_MAX_POINTS];
+    static float ssort[CENTER_MAX_POINTS];
+    int n = 0;
+
+    const int half = centerValid ? CENTER_TRACK_HALF : (FRAME_WIDTH / 2 - 1);
+
+    for (int y = 0; y < FRAME_HEIGHT; y += CENTER_ROW_STEP) {
+        float pred = centerValid ? (centerSlope * (float)y + centerOffset)
+                                 : (float)CENTER_COL;
+        int x0 = (int)pred - half;
+        int x1 = (int)pred + half;
+        if (x0 < 1) x0 = 1;
+        if (x1 > FRAME_WIDTH - 2) x1 = FRAME_WIDTH - 2;
+        if (x1 <= x0) continue;
+
+        const uint16_t *row = pix + (size_t)y * FRAME_WIDTH;
+
+        // 3-column box filter rejects single hot pixels.
+        float best = -1.0f;
+        int bestX = x0;
+        for (int x = x0; x <= x1; x++) {
+            float v = centerLuma(row[x - 1]) + centerLuma(row[x]) + centerLuma(row[x + 1]);
+            if (v > best) { best = v; bestX = x; }
+        }
+        if (best <= 0.0f) continue;
+
+        // Sub-pixel refinement by intensity centroid.
+        int rx0 = bestX - 4; if (rx0 < 0) rx0 = 0;
+        int rx1 = bestX + 4; if (rx1 > FRAME_WIDTH - 1) rx1 = FRAME_WIDTH - 1;
+        float num = 0.0f, den = 0.0f;
+        for (int x = rx0; x <= rx1; x++) {
+            float v = centerLuma(row[x]);
+            num += v * (float)x;
+            den += v;
+        }
+        float cx = (den > 1.0f) ? (num / den) : (float)bestX;
+
+        sy[n] = (float)y;
+        sx[n] = cx;
+        sm[n] = best / 3.0f; // mean luma of the 3-column window
+        n++;
+    }
+
+    if (n < CENTER_MIN_ROWS) return false;
+
+    // Median brightness keeps dark rows out of the fit.
+    for (int i = 0; i < n; i++) ssort[i] = sm[i];
+    for (int i = 1; i < n; i++) {
+        float key = ssort[i];
+        int j = i - 1;
+        while (j >= 0 && ssort[j] > key) { ssort[j + 1] = ssort[j]; j--; }
+        ssort[j + 1] = key;
+    }
+    float threshold = ssort[n / 2] * 0.45f;
+    if (threshold < 6.0f) threshold = 6.0f;
+
+    // First least-squares fit.
+    float Sx = 0, Sy = 0, Sxx = 0, Sxy = 0;
+    int m = 0;
+    for (int i = 0; i < n; i++) {
+        if (sm[i] < threshold) continue;
+        Sx += sy[i];
+        Sy += sx[i];
+        Sxx += sy[i] * sy[i];
+        Sxy += sy[i] * sx[i];
+        m++;
+    }
+    if (m < CENTER_MIN_ROWS) return false;
+
+    float denom = (float)m * Sxx - Sx * Sx;
+    if (fabsf(denom) < 1e-3f) return false;
+    float a = ((float)m * Sxy - Sx * Sy) / denom;
+    float b = (Sy - a * Sx) / (float)m;
+
+    // One outlier-rejection pass.
+    float rsum = 0, rsum2 = 0;
+    int rn = 0;
+    for (int i = 0; i < n; i++) {
+        if (sm[i] < threshold) continue;
+        float r = sx[i] - (a * sy[i] + b);
+        rsum += r;
+        rsum2 += r * r;
+        rn++;
+    }
+    float rmean = (rn > 0) ? (rsum / rn) : 0.0f;
+    float rvar = (rn > 0) ? (rsum2 / rn - rmean * rmean) : 0.0f;
+    float rstd = (rvar > 0.0f) ? sqrtf(rvar) : 0.0f;
+    float limit = (rstd > 0.5f) ? (2.5f * rstd) : 2.0f;
+
+    Sx = Sy = Sxx = Sxy = 0;
+    m = 0;
+    for (int i = 0; i < n; i++) {
+        if (sm[i] < threshold) continue;
+        float r = sx[i] - (a * sy[i] + b);
+        if (fabsf(r - rmean) > limit) continue;
+        Sx += sy[i];
+        Sy += sx[i];
+        Sxx += sy[i] * sy[i];
+        Sxy += sy[i] * sx[i];
+        m++;
+    }
+    if (m < CENTER_MIN_ROWS) return false;
+
+    denom = (float)m * Sxx - Sx * Sx;
+    if (fabsf(denom) < 1e-3f) return false;
+    a = ((float)m * Sxy - Sx * Sy) / denom;
+    b = (Sy - a * Sx) / (float)m;
+
+    if (!isfinite(a) || !isfinite(b)) return false;
+    if (fabsf(a) > CENTER_MAX_SLOPE) return false;
+    if (b < -(float)FRAME_WIDTH || b > 2.0f * (float)FRAME_WIDTH) return false;
+
+    centerConfidence = (float)m / (float)n;
+
+    if (!centerValid) {
+        centerSlope = a;
+        centerOffset = b;
+        centerValid = true;
+    } else {
+        centerSlope  = (1.0f - CENTER_EMA_ALPHA) * centerSlope  + CENTER_EMA_ALPHA * a;
+        centerOffset = (1.0f - CENTER_EMA_ALPHA) * centerOffset + CENTER_EMA_ALPHA * b;
+    }
+    return true;
+}
+
 // ---------------- Extraction ----------------
-// Reads the CENTER COLUMN (averaged over +/- COL_AVG_RANGE columns)
-// down every row -> one R/G/B value per row (vertical spectrum).
+// Reads the tracked centre column (averaged over +/- COL_AVG_RANGE
+// columns) down every row -> one R/G/B value per row (vertical spectrum).
 // The spectrum is indexed by row: index 0 = top of the sensor image.
 // Values are NOT clamped or combined here - raw per-channel averages.
 // Set SPECTRUM_INVERT to 1 if the spectrum appears reversed (e.g. red at
 // the top instead of the bottom) so the graph reads low->high wavelength.
 void extractSpectrum(camera_fb_t *fb, float *outR, float *outG, float *outB) {
-    int colStart = CENTER_COL - COL_AVG_RANGE;
-    int colEnd = CENTER_COL + COL_AVG_RANGE;
-    if (colStart < 0) colStart = 0;
-    if (colEnd >= FRAME_WIDTH) colEnd = FRAME_WIDTH - 1;
-    int numCols = colEnd - colStart + 1;
+    const int numCols = COL_AVG_RANGE * 2 + 1;
 
     for (int row = 0; row < FRAME_HEIGHT; row++) {
+        int center = centerColumnForRow(row);
+        int colStart = center - COL_AVG_RANGE;
+        int colEnd = center + COL_AVG_RANGE;
+
         uint32_t rSum = 0, gSum = 0, bSum = 0;
         for (int col = colStart; col <= colEnd; col++) {
             int pixelIndex = row * FRAME_WIDTH + col;

@@ -102,8 +102,13 @@ Arduino_Canvas *gfx = new Arduino_Canvas(320, 480, g, 0, 0, ROTATION);
 #define MANUAL_EXPOSURE   300
 #define MANUAL_GAIN       0
 
-// Onboard BOOT button: short press = predict, long press = dark frame
-#define DARKFRAME_BUTTON_PIN  0
+// Physical buttons (active LOW, INPUT_PULLUP). Set the real GPIO numbers
+// for this build; use -1 to disable one.
+//   BTN_MAIN_PIN : short press = predict, long press = dark frame
+//   BTN_CAL_PIN  : short press = center-line calibration,
+//                  long press  = wavelength peak report (not applied yet)
+#define BTN_MAIN_PIN          0
+#define BTN_CAL_PIN          -1
 #define DARKFRAME_HOLD_MS     1500
 
 // How the R/G/B channels are combined into the single displayed /
@@ -233,7 +238,7 @@ h1 { color: #00d4ff; margin-bottom: 8px; }
 <body>
 <div class="container">
 <h1>ðŸ”¬ ESP32-S3 Spectrometer</h1>
-<div class="sub">Live Spectrum + Web Camera | <span id="conn">Connecting...</span></div>
+<div class="sub">Live Spectrum + Web Camera | <span id="conn">Connecting...</span> | <span id="center">center: --</span></div>
 <div class="info">
   <div class="box"><h3>Peak Wavelength</h3><div id="peak">-- nm</div></div>
   <div class="box"><h3>Max Intensity</h3><div id="max">--</div></div>
@@ -360,11 +365,16 @@ async function update() {
         document.getElementById('dsStatus').textContent = 'samples: '+j.samples;
         document.getElementById('conn').textContent='Connected';
         document.getElementById('conn').style.color='#00ff88';
-        if (j.col !== undefined) {
-            camMeta.col = j.col;
+        if (j.slope !== undefined) {
+            camMeta.slope = j.slope;
+            camMeta.offset = j.offset;
             camMeta.colRange = j.colRange;
             camMeta.frameWidth = j.frameWidth;
             camMeta.frameHeight = j.frameHeight;
+            camMeta.valid = j.centerValid;
+            document.getElementById('center').textContent =
+                'center: a=' + j.slope.toFixed(4) + ' b=' + j.offset.toFixed(0) +
+                ' conf=' + j.conf + '%' + (j.centerValid ? '' : ' (fallback)');
             if (document.getElementById('camImg').complete) resizeCamOverlay();
         }
         drawSpectrum(j.spectrum, j.scale, j.nmStart, j.nmEnd);
@@ -409,11 +419,10 @@ function updateCam() {
     document.getElementById('camImg').src='/capture?t='+Date.now();
 }
 
-// Vertical line + shaded band overlay showing the measured center
-// column (and the +/- COL_AVG_RANGE columns averaged around it) on the
-// camera snapshot - purely visual, client-side only. Metadata comes
-// from /data so the overlay always matches the firmware constants.
-let camMeta = { col: 320, colRange: 10, frameWidth: 640, frameHeight: 480 };
+// Vertical line + shaded band overlay showing the tracked centre of the
+// spectrum band. The firmware fits x(y) = a*y + b on every frame, so the
+// overlay follows the tilt (angular offset) and horizontal offset.
+let camMeta = { slope: 0, offset: 320, colRange: 10, frameWidth: 640, frameHeight: 480, valid: false };
 
 function resizeCamOverlay() {
     const img = document.getElementById('camImg');
@@ -424,17 +433,25 @@ function resizeCamOverlay() {
     c.clearRect(0,0,ov.width,ov.height);
     if (!ov.width || !ov.height) return;
 
-    const cx = (camMeta.col / camMeta.frameWidth) * ov.width;
-    const half = (camMeta.colRange / camMeta.frameWidth) * ov.width;
+    const W = camMeta.frameWidth, H = camMeta.frameHeight;
+    const px = (row) => ((camMeta.slope * row + camMeta.offset) / W) * ov.width;
+    const half = (camMeta.colRange / W) * ov.width;
+    const xTop = px(0), xBot = px(H - 1);
 
-    c.fillStyle = 'rgba(255,221,0,0.18)';
-    c.fillRect(cx-half, 0, half*2, ov.height);
+    c.fillStyle = camMeta.valid ? 'rgba(255,221,0,0.18)' : 'rgba(255,80,80,0.15)';
+    c.beginPath();
+    c.moveTo(xTop - half, 0);
+    c.lineTo(xTop + half, 0);
+    c.lineTo(xBot + half, ov.height);
+    c.lineTo(xBot - half, ov.height);
+    c.closePath();
+    c.fill();
 
-    c.strokeStyle = '#ffdd00';
+    c.strokeStyle = camMeta.valid ? '#ffdd00' : '#ff6666';
     c.lineWidth = 2;
     c.beginPath();
-    c.moveTo(cx,0);
-    c.lineTo(cx,ov.height);
+    c.moveTo(xTop, 0);
+    c.lineTo(xBot, ov.height);
     c.stroke();
 }
 document.getElementById('camImg').addEventListener('load', resizeCamOverlay);
@@ -551,6 +568,14 @@ void handleData() {
     json += String(FRAME_WIDTH);
     json += ",\"frameHeight\":";
     json += String(FRAME_HEIGHT);
+    json += ",\"centerValid\":";
+    json += centerValid ? "true" : "false";
+    json += ",\"slope\":";
+    json += String(centerSlope, 5);
+    json += ",\"offset\":";
+    json += String(centerOffset, 1);
+    json += ",\"conf\":";
+    json += String(centerConfidence * 100.0f, 0);
     json += ",\"modelReady\":";
     json += MODEL_READY ? "true" : "false";
     json += ",\"hasPred\":";
@@ -664,7 +689,10 @@ void setup() {
 
     Serial.println("\n=== ESP32-S3 Spectrometer + Web (AP mode, column-center, RGB-separate) ===");
 
-    pinMode(DARKFRAME_BUTTON_PIN, INPUT_PULLUP); // BOOT button: HIGH = not pressed, LOW = pressed
+    pinMode(BTN_MAIN_PIN, INPUT_PULLUP);   // main button: predict / dark frame
+#if BTN_CAL_PIN >= 0
+    pinMode(BTN_CAL_PIN, INPUT_PULLUP);    // calibration button
+#endif
 
     // Init LCD
     if (!initDisplay()) {
@@ -809,13 +837,122 @@ void runDarkFrame() {
     lastFrameTime = millis();
 }
 
-// BOOT button: short press = predict, long press (>= DARKFRAME_HOLD_MS)
+// ------------------------------------------------------------
+// CALIBRATION
+// ------------------------------------------------------------
+// Average several detected centre-line fits and lock them in. Automatic
+// tracking keeps running afterwards; this just gives a clean starting
+// point and a sanity check of the tilt/offset.
+void runCenterCalibration() {
+    gfx->fillScreen(BLACK);
+    gfx->setTextSize(1);
+    gfx->setTextColor(YELLOW);
+    gfx->setCursor(10, DISP_HEIGHT / 2 - 10);
+    gfx->println("Centre-line calibration...");
+    gfx->println("Keep the spectrum visible");
+    gfx->flush();
+
+    float sumA = 0.0f, sumB = 0.0f;
+    int ok = 0;
+    for (int i = 0; i < 10; i++) {
+        camera_fb_t *fb = esp_camera_fb_get();
+        if (fb) {
+            if (detectCenterLine(fb)) {
+                sumA += centerSlope;
+                sumB += centerOffset;
+                ok++;
+            }
+            esp_camera_fb_return(fb);
+        }
+        delay(120);
+    }
+
+    gfx->fillScreen(BLACK);
+    gfx->setTextSize(1);
+    gfx->setCursor(10, DISP_HEIGHT / 2 - 20);
+    if (ok > 0) {
+        centerSlope = sumA / (float)ok;
+        centerOffset = sumB / (float)ok;
+        centerValid = true;
+        gfx->setTextColor(GREEN);
+        gfx->printf("Centre line locked\n a = %.4f px/row\n b = %.1f px\n(%d/%d frames)\n",
+                    centerSlope, centerOffset, ok, 10);
+        Serial.printf("CENTER CAL ok=%d a=%.5f b=%.2f\n", ok, centerSlope, centerOffset);
+    } else {
+        gfx->setTextColor(RED);
+        gfx->println("Centre calibration failed");
+        gfx->println("(no spectrum detected)");
+        Serial.println("CENTER CAL failed");
+    }
+    gfx->flush();
+    delay(1500);
+
+    gfx->fillScreen(BLACK);
+    drawAxes();
+    drawColorBar();
+    drawPredictButton(false);
+    gfx->flush();
+    lastFrameTime = millis();
+}
+
+// Wavelength calibration helper. Not applied yet: it only reports the
+// strongest peaks in the current spectrum so the two known reference
+// lines (e.g. 405 / 546 nm) can be matched to sensor rows, then written
+// into CAL_PIXEL_1/2. Applying it at runtime would need the calibration
+// to become variables stored in NVS.
+void runWavelengthCalibration() {
+    if (lastSpectrumMs == 0) {
+        Serial.println("WAVELENGTH CAL: no spectrum yet");
+        return;
+    }
+
+    int idx[6];
+    float val[6];
+    int n = 0;
+
+    for (int i = 4; i < SPECTRUM_LEN - 4; i++) {
+        float v = spectrumCombined[i];
+        if (v < 25.0f) continue;
+        if (!(v > spectrumCombined[i - 1] && v >= spectrumCombined[i + 1])) continue;
+
+        bool merged = false;
+        for (int k = 0; k < n; k++) {
+            if (abs(idx[k] - i) < 12) {
+                merged = true;
+                if (v > val[k]) { idx[k] = i; val[k] = v; }
+                break;
+            }
+        }
+        if (merged) continue;
+        if (n < 6) { idx[n] = i; val[n] = v; n++; }
+    }
+
+    Serial.println("WAVELENGTH CAL - strongest peaks:");
+    if (n == 0) Serial.println("  (none above threshold)");
+    for (int k = 0; k < n; k++) {
+        Serial.printf("  row %3d  %6.1f nm  intensity %.1f\n",
+                      idx[k], pixelToNm((float)idx[k]), val[k]);
+    }
+
+    gfx->fillRect(40, 190, 240, 70, BLACK);
+    gfx->drawRect(40, 190, 240, 70, YELLOW);
+    gfx->setTextSize(1);
+    gfx->setTextColor(YELLOW);
+    gfx->setCursor(50, 200);
+    gfx->println("Wavelength cal: see serial");
+    gfx->setCursor(50, 212);
+    gfx->printf("%d peaks found", n);
+    gfx->flush();
+    delay(1500);
+}
+
+// Main button: short press = predict, long press (>= DARKFRAME_HOLD_MS)
 // = dark frame. Acting on release keeps both actions unambiguous.
-void handleBootButton() {
+void handleMainButton() {
     static bool wasPressed = false;
     static unsigned long pressStart = 0;
 
-    bool pressed = (digitalRead(DARKFRAME_BUTTON_PIN) == LOW);
+    bool pressed = (digitalRead(BTN_MAIN_PIN) == LOW);
 
     if (pressed && !wasPressed) {
         wasPressed = true;
@@ -825,6 +962,26 @@ void handleBootButton() {
         if (millis() - pressStart >= DARKFRAME_HOLD_MS) runDarkFrame();
         else triggerPrediction();
     }
+}
+
+// Calibration button: short press = lock the centre line (tilt + offset),
+// long press = report the strongest peaks (wavelength calibration helper).
+void handleCalButton() {
+#if BTN_CAL_PIN >= 0
+    static bool wasPressed = false;
+    static unsigned long pressStart = 0;
+
+    bool pressed = (digitalRead(BTN_CAL_PIN) == LOW);
+
+    if (pressed && !wasPressed) {
+        wasPressed = true;
+        pressStart = millis();
+    } else if (!pressed && wasPressed) {
+        wasPressed = false;
+        if (millis() - pressStart >= DARKFRAME_HOLD_MS) runWavelengthCalibration();
+        else runCenterCalibration();
+    }
+#endif
 }
 
 void handleTouchButton() {
@@ -884,7 +1041,8 @@ void loop() {
                       (unsigned)ESP.getFreeHeap());
     }
 
-    handleBootButton();
+    handleMainButton();
+    handleCalButton();
     handleTouchButton();
 
     static int frameCount = 0;
@@ -905,6 +1063,10 @@ void loop() {
         Serial.println("Frame capture failed");
         return;
     }
+
+    // Track the spectrum band (tilt + horizontal offset) on this frame
+    // before extracting, so the read-out follows the real line.
+    detectCenterLine(fb);
 
     extractSpectrum(fb, spectrumRawR, spectrumRawG, spectrumRawB);
     esp_camera_fb_return(fb);

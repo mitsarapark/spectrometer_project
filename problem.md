@@ -159,6 +159,37 @@ Debug exception reason: Stack canary watchpoint triggered (loopTask)
 
 ---
 
+## P9 — สเปกตรัมเอียง/เลื่อน และเส้นอ้างอิงไม่ตรงแนวจริง  `FIXED`
+
+**อาการ**
+1. เส้นสเปกตรัมในภาพเอียง (angular offset)
+2. แนวสเปกตรัมเลื่อนซ้าย/ขวา (horizontal offset)
+3. เส้นสีเหลือง (measured center column) เป็นแนวตั้งที่ x คงที่ → ไม่ทับแนวสเปกตรัมจริง
+4. ค่า intensity ถูกอ่านจากตำแหน่งที่คลาดเคลื่อน
+
+**สาเหตุ**
+`extractSpectrum()` ใช้ `CENTER_COL` คงที่ทุกแถว ไม่สนใจความเอียง/การเลื่อนของแนวแสง
+
+**วิธีแก้**
+- เพิ่ม `detectCenterLine()` ใน `spectrum_processing.h`
+  - หาคอลัมน์ที่สว่างที่สุดของแต่ละแถว (สุ่มทุก `CENTER_ROW_STEP = 2`)
+  - ทำ 3-column box filter กัน hot pixel + refine ด้วย intensity centroid
+  - fit เส้นตรง `x(y) = a*y + b` ด้วย least squares และตัด outlier 1 รอบ (2.5σ)
+  - ตรวจ sanity: `|a| <= 0.8`, b อยู่ในช่วงสมเหตุสมผล, inlier >= 40 แถว
+  - smooth ค่า a, b ด้วย EMA (`CENTER_EMA_ALPHA = 0.3`)
+- `extractSpectrum()` เปลี่ยนไปใช้ `centerColumnForRow(y)` = `a*y+b` (clamp ขอบภาพ)
+- ถ้าตรวจไม่เจอแนว (มืด/ไม่มีแสง) → fallback `CENTER_COL` และรายงาน `centerValid=false`
+- LCD แสดง `a`, `b`, `conf%`
+- หน้าเว็บวาด **เส้นเอียง + แถบ** ตามค่า a,b จริง (รับจาก `/data`: `slope`, `offset`, `centerValid`, `conf`)
+
+**ปุ่ม**
+- `BTN_CAL_PIN` กดสั้น → `runCenterCalibration()` เฉลี่ย 10 เฟรมแล้วล็อก a,b (แสดงผลบนจอ)
+- `BTN_CAL_PIN` กดค้าง → `runWavelengthCalibration()` หา peak แรงสุดและพิมพ์ค่า nm ทาง serial
+  (ยังไม่ apply — ต้องเปลี่ยน `CAL_*` เป็นตัวแปร + เก็บ NVS ก่อน)
+- ปุ่มจริงยังต้องตั้ง GPIO: `BTN_MAIN_PIN` (default 0) และ `BTN_CAL_PIN` (default -1 = ปิด)
+
+---
+
 ## ข้อมูลอ้างอิง
 
 - Board: ESP32-S3-Touch-LCD-3.5B (ESP32S3 Dev Module, OPI PSRAM)
