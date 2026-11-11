@@ -508,6 +508,7 @@ bool initCamera() {
 // WEB SERVER HANDLERS
 // ============================================================
 void handleRoot() {
+    Serial.printf("GET / from %s\n", server.client().remoteIP().toString().c_str());
     server.send(200, "text/html", index_html);
 }
 
@@ -655,12 +656,15 @@ void setup() {
     resetTemporalBuffer();
 
     // Init WiFi AP
-    WiFi.softAP(ssid, password);
+    if (!WiFi.softAP(ssid, password)) {
+        Serial.println("WiFi AP failed to start!");
+    }
     IPAddress IP = WiFi.softAPIP();
     Serial.print("WiFi AP started: ");
     Serial.println(ssid);
     Serial.print("IP address: ");
     Serial.println(IP);
+    Serial.printf("AP channel: %d\n", WiFi.channel());
 
     // Show IP on LCD
     gfx->fillScreen(BLACK);
@@ -683,6 +687,13 @@ void setup() {
     server.on("/record", HTTP_GET, handleRecord);
     server.on("/dataset.csv", HTTP_GET, handleDatasetDownload);
     server.on("/dataset/clear", HTTP_GET, handleDatasetClear);
+    server.on("/ping", HTTP_GET, []() {
+        server.send(200, "text/plain", "pong");
+    });
+    server.onNotFound([]() {
+        Serial.printf("404 %s\n", server.uri().c_str());
+        server.send(404, "text/plain", "not found");
+    });
     server.begin();
     Serial.println("Web server started on port 80");
 
@@ -794,6 +805,18 @@ void handleTouchButton() {
 void loop() {
     // Always handle web clients (non-blocking)
     server.handleClient();
+
+    // Heartbeat: confirms the firmware is alive and whether a client is
+    // actually associated with the AP (stations stays 0 if the phone/PC
+    // never joined "ITIM-project").
+    static unsigned long lastHeartbeat = 0;
+    if (millis() - lastHeartbeat >= 5000) {
+        lastHeartbeat = millis();
+        Serial.printf("[hb] up=%lus stations=%d heap=%u\n",
+                      millis() / 1000,
+                      WiFi.softAPgetStationNum(),
+                      (unsigned)ESP.getFreeHeap());
+    }
 
     handleBootButton();
     handleTouchButton();

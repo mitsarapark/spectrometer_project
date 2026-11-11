@@ -14,6 +14,7 @@
  */
 
 #include <LittleFS.h>
+#include <esp_partition.h>
 
 #define DATASET_PATH   "/dataset.csv"
 #define CSV_POINTS     120          // must match MODEL_INPUT_DIM in the header
@@ -52,11 +53,33 @@ static int countDatasetSamples() {
 }
 
 bool initDataset() {
-    datasetReady = LittleFS.begin(true); // format on first boot
+    // A missing SPIFFS/LittleFS partition is the usual reason for
+    // "Failed to initialize LittleFS" - it means the upload used a
+    // partition scheme without one (select "Huge APP (3MB No OTA/1MB
+    // SPIFFS)" in the Arduino IDE).
+    const esp_partition_t *part = esp_partition_find_first(
+        ESP_PARTITION_TYPE_DATA, ESP_PARTITION_SUBTYPE_DATA_SPIFFS, NULL);
+
+    if (part == NULL) {
+        Serial.println("No SPIFFS/LittleFS partition in this build.");
+        Serial.println("Select Partition Scheme: Huge APP (3MB No OTA/1MB SPIFFS)");
+        datasetReady = false;
+        return false;
+    }
+    Serial.printf("Dataset partition '%s' at 0x%06x, %u KB\n",
+                  part->label, (unsigned)part->address,
+                  (unsigned)(part->size / 1024));
+
+    datasetReady = LittleFS.begin(false);
+    if (!datasetReady) {
+        Serial.println("LittleFS mount failed, formatting partition...");
+        datasetReady = LittleFS.begin(true);
+    }
     if (!datasetReady) {
         Serial.println("LittleFS mount failed - dataset disabled");
         return false;
     }
+
     datasetSampleCount = countDatasetSamples();
     Serial.printf("Dataset ready: %d samples in %s\n", datasetSampleCount, DATASET_PATH);
     return true;
