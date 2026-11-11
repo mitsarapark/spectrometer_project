@@ -97,6 +97,7 @@ esp_camera_fb_get() [RGB565 VGA 640x480]
 | ปุ่มที่สาม (`CAL_BUTTON_PIN`, default `-1`) | Axis calibration (ปรับความเอียง/offset) |
 | `http://192.168.4.1/calibrate` | Axis calibration ผ่านเว็บ (ไม่ต้องมีปุ่ม) |
 | `http://192.168.4.1/axis` | ดูค่า `a`, `b`, `detected` |
+| Serial command `c` / `d` / `p` | axis calibrate / dark frame / predict |
 
 ## 7. ML workflow (สรุป)
 
