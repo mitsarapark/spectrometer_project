@@ -44,10 +44,11 @@ Camera (RGB565 VGA 640x480)
 - [x] WiFi AP (`ITIM-project`) + WebServer
 - [x] หน้าเว็บแสดงกราฟ + ภาพกล้อง + เส้น/แถบแนวตั้งบอกคอลัมน์ที่วัด
 - [x] 2-point wavelength calibration (`CAL_PIXEL_*`, `CAL_NM_*`)
-- [x] เก็บ dataset CSV ลง LittleFS ผ่านเว็บ + ดาวน์โหลด/ล้าง
+- [x] เก็บ dataset CSV ลง flash (LittleFS หรือ FFat ตาม partition) ผ่านเว็บ + ดาวน์โหลด/ล้าง
 - [x] PLSR training pipeline (`ml/`) + data augmentation + export header
 - [x] On-device inference (dot product) + แสดงผลบน LCD และเว็บ
 - [x] ปุ่ม PREDICT บนจอ (touch) + BOOT สำรอง
+- [x] Captive portal + mDNS (`http://spectrometer.local`) เข้าเว็บได้ทันทีหลังต่อ WiFi
 - [x] `SPECTRUM_INVERT` สำหรับกลับลำดับ row
 - [x] รีเฟรชทุก 300 ms (`FRAME_INTERVAL_MS`)
 
@@ -80,7 +81,8 @@ Camera (RGB565 VGA 640x480)
 - I2C (TCA9554 + touch): SDA=21, SCL=22
 - BOOT: GPIO0
 
-Board settings: ESP32S3 Dev Module, OPI PSRAM, Huge APP (3MB No OTA/1MB SPIFFS), USB CDC On Boot = Enabled
+Board settings: ESP32S3 Dev Module, OPI PSRAM, USB CDC On Boot = Enabled
+Partition scheme: **Huge APP (3MB No OTA/1MB SPIFFS)** หรือ **16M Flash (3MB APP/9.9MB FATFS)** (โค้ดตรวจและ mount เองอัตโนมัติ)
 
 ## 6. Build / Flash
 
@@ -104,14 +106,19 @@ python train_plsr.py --csv dataset.csv --unit "%"
 
 ## 8. Known issues
 
-- ค่า calibration เป็น placeholder — ต้องวัด 405/546 nm จากหลอด fluorescent จริง
+- ค่า calibration เริ่มต้น map เต็มคอลัมน์เป็น 380–700 nm — ควรวัด 405/546 nm จากหลอด fluorescent จริงแล้วแก้ `CAL_*`
 - Touch (`0x3B`) ยังไม่ยืนยันบนฮาร์ดแวร์; ถ้าไม่เจอจะ fallback ไป BOOT
 - `/capture` ดึงเฟรมใหม่แยกจาก loop → บางรอบ measurement frame ถูกใช้ไป
 - อัตราเฟรมจำกัดจาก canvas flush + JPEG conversion
 - ยังไม่ init PMU (AXP2101); บาง revision อาจต้องทำก่อนใช้กล้อง
 - `MANUAL_EXPOSURE` / `MANUAL_GAIN` ยังไม่ tune กับแสงจริง
-- ต้องเก็บ dataset ใหม่เมื่อเปลี่ยน exposure/gain/calibration/COMBINE_MODE
+- เปลี่ยน exposure/gain/calibration/COMBINE_MODE แล้ว **ต้องเก็บ dataset ใหม่และเทรนใหม่**
 - `test/` เป็น reference เก่า ห้ามใช้ build หลัก
+
+## 8.1 การเข้าเว็บ / storage
+
+- ต่อ WiFi `ITIM-project` แล้วหน้าเว็บจะเด้งเอง (captive portal) หรือพิมพ์ `http://192.168.4.1` / `http://spectrometer.local`
+- Dataset ตรวจ partition อัตโนมัติ: LittleFS (SPIFFS) หรือ FFat (FATFS) — ดู backend ที่ log ตอนบูต
 
 ## 9. Roadmap
 

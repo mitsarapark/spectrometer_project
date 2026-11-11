@@ -34,19 +34,20 @@ test/                    โค้ดทดสอบ (reference เท่าน�
 - 2-point wavelength calibration (ค่าเริ่มต้นเป็น placeholder)
 - กราฟ + color bar + peak (nm)/max/FPS บน LCD
 - WiFi AP + หน้าเว็บแสดงกราฟและภาพกล้อง พร้อมเส้น/แถบแนวตั้งบอกตำแหน่งที่วัด
-- เก็บ dataset CSV ลง flash ผ่านเว็บ แล้วดาวน์โหลดไปเทรน
+- เก็บ dataset CSV ลง flash (LittleFS หรือ FFat) ผ่านเว็บ แล้วดาวน์โหลดไปเทรน
 - On-device PLSR inference: แตะปุ่ม PREDICT บนจอ (หรือกด BOOT สั้น)
+- Captive portal + mDNS: ต่อ WiFi แล้วหน้าเว็บเด้งเอง หรือใช้ `http://spectrometer.local`
 
 ## Build / Flash
 
 1. เปิด `spectrometer/spectrometer.ino` ใน Arduino IDE
 2. Board: **ESP32S3 Dev Module**
    - PSRAM: **OPI PSRAM**
-   - Partition: **Huge APP (3MB No OTA/1MB SPIFFS)**
+   - Partition: **Huge APP (3MB No OTA/1MB SPIFFS)** หรือ **16M Flash (3MB APP/9.9MB FATFS)** (โค้ดเลือก backend เอง)
    - USB CDC On Boot: **Enabled**
 3. Libraries: `Arduino_GFX`, `TCA9554`, `esp32-camera` (มากับ ESP32 core)
 4. Verify / Upload
-5. ต่อ WiFi `ITIM-project` (password `itimsarapark`) แล้วเปิด `http://192.168.4.1`
+5. ต่อ WiFi `ITIM-project` (password `itimsarapark`) → หน้าเว็บเด้งเอง (captive portal) หรือเปิด `http://192.168.4.1` / `http://spectrometer.local`
 
 ## ML quick start
 

@@ -1,4 +1,4 @@
-# ML pipeline (PLSR)
+﻿# ML pipeline (PLSR)
 
 Workflow for turning spectrometer measurements into an on-device
 concentration prediction.
@@ -12,7 +12,7 @@ ESP32 (record samples)  ->  dataset.csv  ->  train_plsr.py  ->  model_weights.h 
 1. Put the reference sample in the spectrometer and wait ~2 s for the
    graph to settle (temporal averaging needs a few frames).
 2. Open `http://192.168.4.1`, enter the known concentration and press
-   **Record sample**. One CSV row is appended to LittleFS.
+   **Record sample**. One CSV row is appended to device filesystem (LittleFS/FFat).
 3. Repeat for every sample. Use several concentrations, ideally
    including repeats, so the model can separate signal from noise.
 4. Press **Download CSV** to save `dataset.csv` to your PC.

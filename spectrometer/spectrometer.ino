@@ -1,9 +1,11 @@
-#include <esp_camera.h>
+﻿#include <esp_camera.h>
 #include <Arduino_GFX_Library.h>
 #include "TCA9554.h"
 #include <Wire.h>
 #include <WiFi.h>
 #include <WebServer.h>
+#include <DNSServer.h>
+#include <ESPmDNS.h>
 #include "img_converters.h"
 
 // ============================================================
@@ -170,6 +172,7 @@ Arduino_Canvas *gfx = new Arduino_Canvas(320, 480, g, 0, 0, ROTATION);
 const char* ssid     = "ITIM-project";
 const char* password = "itimsarapark";
 WebServer server(80);
+DNSServer dnsServer;
 
 #include "inference.h"
 #include "dataset.h"
@@ -218,7 +221,7 @@ h1 { color: #00d4ff; margin-bottom: 8px; }
 </head>
 <body>
 <div class="container">
-<h1>🔬 ESP32-S3 Spectrometer</h1>
+<h1>ðŸ”¬ ESP32-S3 Spectrometer</h1>
 <div class="sub">Live Spectrum + Web Camera | <span id="conn">Connecting...</span></div>
 <div class="info">
   <div class="box"><h3>Peak Wavelength</h3><div id="peak">-- nm</div></div>
@@ -228,7 +231,7 @@ h1 { color: #00d4ff; margin-bottom: 8px; }
 </div>
 <canvas id="spectrumCanvas" width="640" height="300"></canvas>
 <div class="cam-box">
-  <h3>📷 Camera Snapshot</h3>
+  <h3>ðŸ“· Camera Snapshot</h3>
   <div class="cam-wrap">
     <img id="camImg" src="/capture" alt="Camera">
     <canvas id="camOverlay"></canvas>
@@ -236,7 +239,7 @@ h1 { color: #00d4ff; margin-bottom: 8px; }
   <div class="status">Auto-refreshes every 1 second. Yellow line + band = measured center column.</div>
 </div>
 <div class="cam-box" style="margin-top:20px">
-  <h3>🧪 Dataset</h3>
+  <h3>ðŸ§ª Dataset</h3>
   <div class="row">
     <label for="concInput">Concentration</label>
     <input id="concInput" type="number" step="0.01" value="0">
@@ -613,7 +616,11 @@ void handleRecord() {
 }
 
 void handleDatasetDownload() {
-    File f = LittleFS.open(DATASET_PATH, FILE_READ);
+    if (datasetFS == nullptr) {
+        server.send(503, "text/plain", "dataset storage unavailable");
+        return;
+    }
+    fs::File f = datasetFS->open(DATASET_PATH, FILE_READ);
     if (!f) {
         server.send(404, "text/plain", "dataset not found");
         return;
@@ -666,6 +673,17 @@ void setup() {
     Serial.println(IP);
     Serial.printf("AP channel: %d\n", WiFi.channel());
 
+    // Captive portal: resolve every hostname to this AP so phones/PCs pop
+    // up the page automatically after joining the network. Typing
+    // http://192.168.4.1 (or http://spectrometer.local) still works.
+    dnsServer.start(53, "*", WiFi.softAPIP());
+    Serial.println("Captive portal DNS started");
+
+    if (MDNS.begin("spectrometer")) {
+        MDNS.addService("http", "tcp", 80);
+        Serial.println("mDNS: http://spectrometer.local");
+    }
+
     // Show IP on LCD
     gfx->fillScreen(BLACK);
     gfx->setTextColor(CYAN);
@@ -690,9 +708,15 @@ void setup() {
     server.on("/ping", HTTP_GET, []() {
         server.send(200, "text/plain", "pong");
     });
+    // Anything else is treated as a captive-portal probe (Android's
+    // /generate_204, Apple's /hotspot-detect.html, Windows NCSI, ...) and
+    // redirected to the main page so the phone/PC opens it by itself.
     server.onNotFound([]() {
-        Serial.printf("404 %s\n", server.uri().c_str());
-        server.send(404, "text/plain", "not found");
+        String uri = server.uri();
+        Serial.printf("PORTAL %s\n", uri.c_str());
+        String target = String("http://") + WiFi.softAPIP().toString() + "/";
+        server.sendHeader("Location", target, true);
+        server.send(302, "text/plain", "");
     });
     server.begin();
     Serial.println("Web server started on port 80");
@@ -805,6 +829,7 @@ void handleTouchButton() {
 void loop() {
     // Always handle web clients (non-blocking)
     server.handleClient();
+    dnsServer.processNextRequest();
 
     // Heartbeat: confirms the firmware is alive and whether a client is
     // actually associated with the AP (stations stays 0 if the phone/PC

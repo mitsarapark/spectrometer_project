@@ -13,6 +13,7 @@
 4. เปิด WiFi AP ให้เว็บเบราว์เซอร์ดู **ภาพจากกล้อง + กราฟ** พร้อมเส้น/แถบแนวตั้งบอกตำแหน่งที่วัด
 5. เก็บ dataset ลง flash ผ่านเว็บ เพื่อนำไปเทรน PLSR บน PC
 6. รันโมเดลบน ESP32 ทำนายความเข้มข้นของสารเมื่อกดปุ่มบนจอ
+7. เปิด captive portal + mDNS (`http://spectrometer.local`) ให้เข้าเว็บได้ง่าย
 
 ## 2. โครงสร้างไฟล์
 
@@ -40,7 +41,7 @@ README.md                     ภาพรวม + วิธี build/flash
 
 - Board: **ESP32S3 Dev Module**
 - PSRAM: **OPI PSRAM** (จำเป็น เพราะ frame buffer RGB565 VGA + canvas)
-- Flash/Partition: **Huge APP (3MB No OTA/1MB SPIFFS)** (LittleFS ใช้ partition นี้)
+- Partition: **Huge APP (3MB No OTA/1MB SPIFFS)** หรือ **16M Flash (3MB APP/9.9MB FATFS)** — ทั้งสองแบบใช้ได้ (LittleFS หรือ FFat ตาม partition ที่พบ)
 - USB CDC On Boot: **Enabled** (ถ้าต้องการ Serial)
 - Libraries: `esp32-camera` (มากับ ESP32 core), `Arduino_GFX` (moononournation), `TCA9554`
 
