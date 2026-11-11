@@ -6,6 +6,7 @@
 #include <WebServer.h>
 #include <DNSServer.h>
 #include <ESPmDNS.h>
+#include <Preferences.h>
 #include "img_converters.h"
 
 // ============================================================
@@ -147,6 +148,11 @@ Arduino_Canvas *gfx = new Arduino_Canvas(320, 480, g, 0, 0, ROTATION);
 #define TOUCH_I2C_ADDR        0x3B
 #define TOUCH_POLL_MS         60
 
+// Axis auto-tracking per frame. 0 = the yellow line only moves when a
+// calibration is requested (button, serial 'c' or /calibrate); set to 1
+// to let it follow the band continuously again.
+#define AXIS_AUTO_DETECT      0
+
 // Display layout (x=position, y=intensity)
 #define DISP_WIDTH        320
 #define DISP_HEIGHT       480
@@ -184,6 +190,7 @@ const char* ssid     = "ITIM-project";
 const char* password = "itimsarapark";
 WebServer server(80);
 DNSServer dnsServer;
+Preferences axisPrefs;
 // Diagnostic listener: tells us when a browser tries HTTPS (port 443)
 // instead of plain HTTP, which is a common reason "the page never loads".
 WiFiServer httpsProbe(443);
@@ -233,7 +240,6 @@ h1 { color: #00d4ff; margin-bottom: 8px; }
 .cam-box h3 { margin: 0 0 10px 0; color: #00ff88; }
 .cam-wrap { position: relative; max-width: 640px; }
 #camImg { width: 100%; border: 1px solid #333; display: block; border-radius: 4px; background: #000; }
-#camOverlay { position: absolute; top: 0; left: 0; width: 100%; height: 100%; pointer-events: none; }
 .status { color: #666; font-size: 12px; margin-top: 10px; }
 .row { display: flex; gap: 10px; align-items: center; flex-wrap: wrap; }
 .row input { background: #0a0a0f; color: #fff; border: 1px solid #444; border-radius: 4px; padding: 6px 8px; width: 110px; }
@@ -256,9 +262,8 @@ h1 { color: #00d4ff; margin-bottom: 8px; }
   <h3>ðŸ“· Camera Snapshot</h3>
   <div class="cam-wrap">
     <img id="camImg" src="/capture" alt="Camera">
-    <canvas id="camOverlay"></canvas>
   </div>
-  <div class="status">Auto-refreshes every 1 second. Yellow line + band = measured center column.</div>
+  <div class="status" id="axisStatus">Auto-refreshes every 1 second. Yellow line = measured center, thin edges = averaged columns.</div>
 </div>
 <div class="cam-box" style="margin-top:20px">
   <h3>ðŸ§ª Dataset</h3>
@@ -267,6 +272,7 @@ h1 { color: #00d4ff; margin-bottom: 8px; }
     <input id="concInput" type="number" step="0.01" value="0">
     <button id="recordBtn">Record sample</button>
     <button id="calBtn">Calibrate axis</button>
+    <button id="autoBtn">Auto align</button>
     <a id="dlLink" href="/dataset.csv"><button>Download CSV</button></a>
     <button id="clearBtn">Clear</button>
   </div>
@@ -372,16 +378,10 @@ async function update() {
         document.getElementById('dsStatus').textContent = 'samples: '+j.samples;
         document.getElementById('conn').textContent='Connected';
         document.getElementById('conn').style.color='#00ff88';
-        if (j.col !== undefined) {
-            camMeta.col = j.col;
-            camMeta.colRange = j.colRange;
-            camMeta.frameWidth = j.frameWidth;
-            camMeta.frameHeight = j.frameHeight;
-            camMeta.axisA = j.axisA;
-            camMeta.axisB = j.axisB;
-            camMeta.axisOn = j.axisOn;
-            if (document.getElementById('camImg').complete) resizeCamOverlay();
-        }
+        document.getElementById('axisStatus').textContent =
+            'Axis a=' + j.axisA.toFixed(4) + '  b=' + j.axisB.toFixed(1) + ' px ' +
+            (j.axisLocked ? '(locked)' : '(not calibrated)') +
+            ' | yellow line = measured center';
         drawSpectrum(j.spectrum, j.scale, j.nmStart, j.nmEnd);
     }catch(e){
         document.getElementById('conn').textContent='Disconnected';
@@ -424,69 +424,41 @@ async function calibrateAxis() {
     try {
         const r = await fetch('/calibrate');
         const j = await r.json();
-        el.textContent = 'axis a=' + j.a.toFixed(4) + '  b=' + j.b.toFixed(1) + ' px';
-        el.style.color = '#00ff88';
+        el.textContent = j.ok
+            ? ('axis a=' + j.a.toFixed(4) + '  b=' + j.b.toFixed(1) + ' px (locked)')
+            : 'axis calibration failed (no spectrum)';
+        el.style.color = j.ok ? '#00ff88' : '#ff4444';
     } catch (e) {
         el.textContent = 'axis calibration failed';
         el.style.color = '#ff4444';
     }
 }
 
+async function autoAlign() {
+    const el = document.getElementById('dsStatus');
+    el.textContent = 'auto-aligning axis...';
+    el.style.color = '#ffaa00';
+    try {
+        const r = await fetch('/axis/auto');
+        const j = await r.json();
+        el.textContent = j.ok
+            ? ('axis a=' + j.a.toFixed(4) + '  b=' + j.b.toFixed(1) + ' px (locked)')
+            : 'no spectrum detected';
+        el.style.color = j.ok ? '#00ff88' : '#ff4444';
+    } catch (e) {
+        el.textContent = 'auto align failed';
+        el.style.color = '#ff4444';
+    }
+}
+
 document.getElementById('recordBtn').addEventListener('click', recordSample);
 document.getElementById('calBtn').addEventListener('click', calibrateAxis);
+document.getElementById('autoBtn').addEventListener('click', autoAlign);
 document.getElementById('clearBtn').addEventListener('click', clearDataset);
 
 function updateCam() {
     document.getElementById('camImg').src='/capture?t='+Date.now();
 }
-
-// Tilted line + shaded band overlay showing the measured spectrum axis
-// x(y) = axisA * y + axisB (and the +/- COL_AVG_RANGE columns averaged
-// around it). Falls back to a vertical line at `col` when auto-detection
-// has not locked onto the band yet. Metadata comes from /data.
-let camMeta = {
-    col: 320, colRange: 10, frameWidth: 640, frameHeight: 480,
-    axisA: 0, axisB: 320, axisOn: false
-};
-
-function resizeCamOverlay() {
-    const img = document.getElementById('camImg');
-    const ov = document.getElementById('camOverlay');
-    ov.width = img.clientWidth;
-    ov.height = img.clientHeight;
-    const c = ov.getContext('2d');
-    c.clearRect(0,0,ov.width,ov.height);
-    if (!ov.width || !ov.height) return;
-
-    const sx = ov.width / camMeta.frameWidth;
-    const sy = ov.height / camMeta.frameHeight;
-    const a = camMeta.axisOn ? camMeta.axisA : 0;
-    const b = camMeta.axisOn ? camMeta.axisB : camMeta.col;
-
-    const x0 = (b + a * 0) * sx;
-    const x1 = (b + a * camMeta.frameHeight) * sx;
-    const half = camMeta.colRange * sx;
-
-    // Shaded band following the fitted line.
-    c.fillStyle = 'rgba(255,221,0,0.18)';
-    c.beginPath();
-    c.moveTo(x0-half, 0);
-    c.lineTo(x1-half, ov.height);
-    c.lineTo(x1+half, ov.height);
-    c.lineTo(x0+half, 0);
-    c.closePath();
-    c.fill();
-
-    // Center line.
-    c.strokeStyle = '#ffdd00';
-    c.lineWidth = 2;
-    c.beginPath();
-    c.moveTo(x0, 0);
-    c.lineTo(x1, ov.height);
-    c.stroke();
-}
-document.getElementById('camImg').addEventListener('load', resizeCamOverlay);
-window.addEventListener('resize', resizeCamOverlay);
 
 setInterval(update,500);
 setInterval(updateCam,1000);
@@ -632,12 +604,38 @@ void handleData() {
     server.send(200, "application/json", json);
 }
 
+// Burn the measurement line into the frame served by /capture. The old
+// web overlay was drawn from /data, i.e. from a different frame, so it
+// always lagged the image; now the line and the spectrum are the same
+// snapshot.
+static void drawAxisOnFrame(camera_fb_t *fb) {
+    uint16_t *pix = (uint16_t *)fb->buf;
+    const int w = fb->width;
+    const int h = fb->height;
+    const uint16_t lineColor = RGB565(255, 221, 0);   // yellow
+    const uint16_t edgeColor = RGB565(110, 100, 30);  // sampled band edges
+
+    for (int y = 0; y < h; y++) {
+        int c = (int)(specSlope * (float)y + specIntercept + 0.5f);
+        for (int dx = -1; dx <= 1; dx++) {
+            int x = c + dx;
+            if (x >= 0 && x < w) pix[(size_t)y * w + x] = lineColor;
+        }
+        int e1 = c - COL_AVG_RANGE;
+        int e2 = c + COL_AVG_RANGE;
+        if (e1 >= 0 && e1 < w) pix[(size_t)y * w + e1] = edgeColor;
+        if (e2 >= 0 && e2 < w) pix[(size_t)y * w + e2] = edgeColor;
+    }
+}
+
 void handleCapture() {
     camera_fb_t *fb = esp_camera_fb_get();
     if (!fb) {
         server.send(500, "text/plain", "Camera capture failed");
         return;
     }
+
+    drawAxisOnFrame(fb);
 
     uint8_t* jpg_buf = NULL;
     size_t jpg_len = 0;
@@ -704,6 +702,30 @@ void handleDatasetClear() {
 
 // ---------------- Axis calibration / status endpoints ----------------
 bool runAxisCalibration(); // defined with the button handlers below
+bool autoAlignAxis();
+
+// The calibrated line lives in NVS so it survives a reboot. It is only
+// rewritten by a calibration - never by the per-frame pipeline.
+void loadAxisCalibration() {
+    axisPrefs.begin("axis", true);
+    if (axisPrefs.isKey("a") && axisPrefs.isKey("b")) {
+        specSlope = axisPrefs.getFloat("a", 0.0f);
+        specIntercept = axisPrefs.getFloat("b", (float)CENTER_COL);
+        axisDetected = true;
+        axisLocked = true;
+        clampSpectrumAxis();
+        Serial.printf("Axis loaded from NVS: a=%.4f b=%.1f (locked)\n",
+                      specSlope, specIntercept);
+    }
+    axisPrefs.end();
+}
+
+void saveAxisCalibration() {
+    axisPrefs.begin("axis", false);
+    axisPrefs.putFloat("a", specSlope);
+    axisPrefs.putFloat("b", specIntercept);
+    axisPrefs.end();
+}
 
 void handleCalibrate() {
     bool ok = runAxisCalibration();
@@ -732,11 +754,45 @@ void handleAxis() {
     server.send(200, "application/json", out);
 }
 
-// Drop the manual lock and let the per-frame tracker take over again.
+// One-shot detection used by /axis/auto and serial 'a': fit the current
+// frame, lock the result and store it. Never runs on its own.
+bool autoAlignAxis() {
+    camera_fb_t *fb = esp_camera_fb_get();
+    if (!fb) return false;
+
+    float a = 0.0f, b = 0.0f;
+    bool ok = fitSpectrumAxis(fb, a, b);
+    esp_camera_fb_return(fb);
+
+    if (!ok) {
+        Serial.println("Auto axis: no spectrum detected");
+        return false;
+    }
+
+    specSlope = a;
+    specIntercept = b;
+    axisDetected = true;
+    axisLocked = true;
+    clampSpectrumAxis();
+    saveAxisCalibration();
+    Serial.printf("Auto axis: a=%.4f b=%.1f (locked)\n", specSlope, specIntercept);
+    return true;
+}
+
+// Drop the manual lock and let the per-frame tracker take over again
+// (only useful when AXIS_AUTO_DETECT is 1).
 void handleAxisAuto() {
-    axisLocked = false;
-    Serial.println("Axis lock released (web) - auto tracking");
-    server.send(200, "application/json", "{\"ok\":true,\"locked\":false}");
+    bool ok = autoAlignAxis();
+    String out = "{\"ok\":";
+    out += ok ? "true" : "false";
+    out += ",\"locked\":";
+    out += axisLocked ? "true" : "false";
+    out += ",\"a\":";
+    out += String(specSlope, 5);
+    out += ",\"b\":";
+    out += String(specIntercept, 2);
+    out += "}";
+    server.send(200, "application/json", out);
 }
 
 // ============================================================
@@ -777,6 +833,7 @@ void setup() {
     }
 
     resetTemporalBuffer();
+    loadAxisCalibration();
 
     // Init WiFi AP
     WiFi.onEvent(onWiFiEvent);
@@ -898,7 +955,7 @@ static void sortFloats(float *v, int n) {
 // short burst and lock it in. Point the spectrometer at a known, steady
 // light source before running this. While locked, updateSpectrumAxis()
 // stops tracking so the line only changes on the next calibration
-// (serial 'a' or /axis/auto releases the lock).
+// ('c' = 20-frame median, 'a' or /axis/auto = single-frame refit).
 bool runAxisCalibration() {
     gfx->fillScreen(BLACK);
     gfx->setTextSize(1);
@@ -938,6 +995,7 @@ bool runAxisCalibration() {
         axisDetected = true;
         axisLocked = true;   // freeze the line until the next calibration
         clampSpectrumAxis();
+        saveAxisCalibration();
         gfx->setTextColor(GREEN);
         gfx->printf("Axis OK (locked)\n a = %+.4f\n b = %.1f px", specSlope, specIntercept);
         Serial.printf("Axis calib: a=%.4f b=%.1f (from %d frames, locked)\n",
@@ -1033,8 +1091,7 @@ void handleSerialCommands() {
         } else if (c == 'p' || c == 'P') {
             triggerPrediction();
         } else if (c == 'a' || c == 'A') {
-            axisLocked = false;
-            Serial.println("Axis lock released - auto tracking");
+            autoAlignAxis();
         }
     }
 }
