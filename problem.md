@@ -7,7 +7,10 @@
 
 ---
 
-## P1 — เปิดเว็บ `192.168.4.1` ไม่ได้ / ไม่มี request เข้ามาที่บอร์ด  `OPEN`
+## P1 — เปิดเว็บ `192.168.4.1` ไม่ได้ / ไม่มี request เข้ามาที่บอร์ด  `FIXED (สาเหตุหลัก = P8)`
+
+> สรุป: request แรก (`PORTAL /hotspot-detect.html`) เข้ามาถึงบอร์ดจริง แต่ทำให้เกิด stack overflow แล้วบอร์ดรีบูต
+> หลังรีบูต request ที่พิมพ์ตามมาจึงไม่เคยถูกตอบ ดูรายละเอียดที่ **P8**
 
 **อาการ**
 - ต่อ WiFi `ITIM-project` ได้ (`stations=1`) แต่เปิด `http://192.168.4.1` แล้วไม่ขึ้น
@@ -126,6 +129,33 @@ Touch 0x3B: not found (use BOOT button)
 ## P7 — บาง revision ต้อง init PMU (AXP2101) ก่อนใช้กล้อง  `OPEN`
 
 เวอร์ชันหลักยังไม่ init PMU ถ้าเจอกล้องไม่ขึ้นบนบอร์ดบาง revision ให้ดูตัวอย่างใน `test/camera_server/`
+
+---
+
+## P8 — `Stack canary watchpoint triggered (loopTask)` ตอนมี request แรก  `FIXED`
+
+**อาการ**
+```
+[ap] client connected (aid=1)
+PORTAL /hotspot-detect.html
+Guru Meditation Error: Core 1 panic'ed (Unhandled debug exception).
+Debug exception reason: Stack canary watchpoint triggered (loopTask)
+```
+บอร์ดรีบูตทันทีที่มีคนเปิดเว็บ → หลังรีบูต AP กลับมาแต่ request ใหม่ไม่เคยถูกตอบ (ทำให้ดูเหมือน "ไม่มี request")
+
+**สาเหตุ**
+สแตกของ Arduino loop task มีขนาด default 8 KB แต่โค้ดจอง buffer ขนาดใหญ่บน stack:
+- `loop()`: `float tmpR[480], tmpG[480], tmpB[480]` = 5,760 bytes
+- `captureDarkFrame()`: `float[480] x3` + `double[480] x3` = ~17 KB (เกินแน่นอนเมื่อกด BOOT ค้าง)
+
+เมื่อรวมกับ call chain ของ WebServer/camera/LCD ทำให้ canary ท้าย stack ถูกเขียนทับ
+
+**วิธีแก้**
+- ย้าย buffer ใน `loop()` เป็น `static`
+- ย้าย buffer ใน `captureDarkFrame()` เป็น `static` และเปลี่ยน sum จาก `double` เป็น `float`
+- เพิ่ม `SET_LOOP_TASK_STACK_SIZE(16 * 1024)` (ภายใต้ `#ifdef` เพื่อความเข้ากันได้กับ core รุ่นต่างๆ)
+
+**กฎที่ควรจำ**: ห้ามประกาศ array ขนาด ~1 KB ขึ้นไปบน stack ใน loop task (โดยเฉพาะ `[SPECTRUM_LEN]`)
 
 ---
 

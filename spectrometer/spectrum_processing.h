@@ -103,8 +103,15 @@ void resetTemporalBuffer() {
 
 // ---------------- Dark frame ----------------
 void captureDarkFrame() {
-    float tmpR[SPECTRUM_LEN], tmpG[SPECTRUM_LEN], tmpB[SPECTRUM_LEN];
-    double sumR[SPECTRUM_LEN] = {0}, sumG[SPECTRUM_LEN] = {0}, sumB[SPECTRUM_LEN] = {0};
+    // These buffers are static on purpose: float[480] x3 + double[480] x3
+    // would need ~17 KB of stack and overflow the Arduino loop task
+    // (8 KB), which shows up as "Stack canary watchpoint triggered".
+    static float tmpR[SPECTRUM_LEN], tmpG[SPECTRUM_LEN], tmpB[SPECTRUM_LEN];
+    static float sumR[SPECTRUM_LEN], sumG[SPECTRUM_LEN], sumB[SPECTRUM_LEN];
+
+    for (int i = 0; i < SPECTRUM_LEN; i++) {
+        sumR[i] = 0; sumG[i] = 0; sumB[i] = 0;
+    }
 
     for (int f = 0; f < 8; f++) {
         camera_fb_t *fb = esp_camera_fb_get();

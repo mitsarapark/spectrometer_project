@@ -122,6 +122,7 @@ esp_camera_fb_get() [RGB565 VGA 640x480]
 - Frame rate จริงจำกัดด้วย canvas flush + JPEG conversion; `FRAME_INTERVAL_MS` = 300 ms
 - `MANUAL_EXPOSURE` / `MANUAL_GAIN` ต้อง tune ตามแหล่งแสงจริง (default 300 / 0)
 - `/record` จะปฏิเสธถ้าข้อมูลสเปกตรัมเก่าเกิน 3 วินาที
+- **Stack**: ห้ามประกาศ array ขนาดใหญ่ (~2 KB ขึ้นไป เช่น `[SPECTRUM_LEN]`) บน stack ของ loop task — เคยทำให้เกิด `Stack canary watchpoint triggered (loopTask)`; ใช้ `static` แทน (ดู `problem.md` P8)
 - เปลี่ยน exposure/gain/calibration/COMBINE_MODE แล้ว **ต้องเก็บ dataset ใหม่และเทรนใหม่**
 - ยังไม่มี wavelength calibration อัตโนมัติ และยังไม่มี Fe analysis
 

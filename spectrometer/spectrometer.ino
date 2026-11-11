@@ -181,6 +181,14 @@ WiFiServer httpsProbe(443);
 #include "dataset.h"
 #include "touch.h"
 
+// Give the Arduino loop task extra headroom when the core supports it
+// (the spectrum pipeline, JPEG conversion and web handlers all run here).
+// The large scratch buffers have been moved off the stack, so this is
+// only a safety margin.
+#ifdef SET_LOOP_TASK_STACK_SIZE
+SET_LOOP_TASK_STACK_SIZE(16 * 1024);
+#endif
+
 // Timestamp of the last completed spectrum measurement. /record rejects
 // requests when this is stale so a sample can't be saved with old data.
 unsigned long lastSpectrumMs = 0;
@@ -907,7 +915,9 @@ void loop() {
     applyTemporalAverage(spectrumRawR, spectrumRawG, spectrumRawB,
                           spectrumSmoothR, spectrumSmoothG, spectrumSmoothB);
 
-    float tmpR[SPECTRUM_LEN], tmpG[SPECTRUM_LEN], tmpB[SPECTRUM_LEN];
+    // Static (not stack) scratch buffers: three float[480] arrays are
+    // ~5.7 KB, enough to overflow the default 8 KB loop task stack.
+    static float tmpR[SPECTRUM_LEN], tmpG[SPECTRUM_LEN], tmpB[SPECTRUM_LEN];
     applyMovingAverage(spectrumSmoothR, tmpR, SPECTRUM_LEN, SMOOTH_WINDOW);
     applyMovingAverage(spectrumSmoothG, tmpG, SPECTRUM_LEN, SMOOTH_WINDOW);
     applyMovingAverage(spectrumSmoothB, tmpB, SPECTRUM_LEN, SMOOTH_WINDOW);
