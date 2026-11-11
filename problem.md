@@ -234,3 +234,4 @@ pass แรกคำนวณเส้นได้ถูกต้อง แต�
   - `3604d8b` fix: start web server before boot splash; add AP event and TLS probe logs
   - `af1a461` fix: move large spectrum buffers off the loop stack (stack canary crash)
   - `b81443c` feat: auto-detect tilted spectrum axis with linear fit and calibration
+  - `9687e08` fix: axis fit rejected all points because the residual threshold was scoped inside the pass loop
