@@ -7,7 +7,8 @@
  *    FRAME_WIDTH, FRAME_HEIGHT, CENTER_COL, COL_AVG_RANGE,
  *    SPECTRUM_LEN, SPECTRUM_INVERT, TEMPORAL_FRAMES, SMOOTH_WINDOW,
  *    COMBINE_MODE (COMBINE_REC709 / COMBINE_REC601 / COMBINE_AVERAGE),
- *    CAL_PIXEL_1, CAL_NM_1, CAL_PIXEL_2, CAL_NM_2
+ *    CAL_PIXEL_1, CAL_NM_1, CAL_PIXEL_2, CAL_NM_2,
+ *    SPEC_NM_MIN, SPEC_NM_MAX
  *
  *  Design notes (per review):
  *   - RGB channels are kept SEPARATE all the way through the pipeline
@@ -206,13 +207,22 @@ void combineForDisplay(float *r, float *g, float *b, float *out) {
 
 // ---------------- Pixel index -> wavelength (2-point linear calibration) ----------------
 // CAL_PIXEL_1/2 are row indices and CAL_NM_1/2 the wavelengths of two
-// known lines (e.g. a fluorescent tube's 405 nm and 546 nm peaks).
-// Until real values are measured this is a placeholder mapping.
+// known lines. The default configuration maps the full sensor column to
+// 380-700 nm; replace CAL_* with measured reference lines (e.g. a
+// fluorescent tube's 405 nm and 546 nm peaks) for a real calibration.
+// Results are clamped to the SPEC_NM_MIN..SPEC_NM_MAX measured window.
 inline float pixelToNm(float idx) {
     const int span = (int)CAL_PIXEL_2 - (int)CAL_PIXEL_1;
-    if (span == 0) return (float)CAL_NM_1;
-    const float slope = ((float)CAL_NM_2 - (float)CAL_NM_1) / (float)span;
-    return (float)CAL_NM_1 + slope * (idx - (float)CAL_PIXEL_1);
+    float nm;
+    if (span == 0) {
+        nm = (float)CAL_NM_1;
+    } else {
+        const float slope = ((float)CAL_NM_2 - (float)CAL_NM_1) / (float)span;
+        nm = (float)CAL_NM_1 + slope * (idx - (float)CAL_PIXEL_1);
+    }
+    if (nm < SPEC_NM_MIN) nm = SPEC_NM_MIN;
+    if (nm > SPEC_NM_MAX) nm = SPEC_NM_MAX;
+    return nm;
 }
 
 // ---------------- Wavelength -> approximate visible color ----------------

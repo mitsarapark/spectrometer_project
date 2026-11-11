@@ -63,8 +63,9 @@ Camera (RGB565 VGA 640x480)
 | `SMOOTH_WINDOW` | 7 | moving average |
 | `FRAME_INTERVAL_MS` | 300 | คาบอัปเดต |
 | `COMBINE_MODE` | `COMBINE_REC709` | Rec.709 / Rec.601 / average |
-| `CAL_PIXEL_1/2` | 40 / 440 | placeholder |
-| `CAL_NM_1/2` | 405 / 546 nm | placeholder (fluorescent lines) |
+| `CAL_PIXEL_1/2` | 0 / 479 | default เต็มคอลัมน์ |
+| `CAL_NM_1/2` | 380 / 700 nm | ช่วง visible; แก้เป็นค่าที่วัดจริงได้ |
+| `SPEC_NM_MIN/MAX` | 380 / 700 nm | clamp ผล `pixelToNm()` |
 | `MANUAL_EXPOSURE` | 300 | ต้อง tune กับแสงจริง |
 | `MANUAL_GAIN` | 0 | ต้อง tune กับแสงจริง |
 | `DISPLAY_MAX_INTENSITY` | 300 | สเกลจอ (ไม่ใช่ clamp ข้อมูล) |

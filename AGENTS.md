@@ -114,7 +114,8 @@ esp_camera_fb_get() [RGB565 VGA 640x480]
 
 ## 9. Known issues / gotchas
 
-- **ค่า calibration เป็น placeholder** (405 nm @ row 40, 546 nm @ row 440) ต้องวัดจากหลอด fluorescent จริงแล้วแก้ `CAL_*`
+- **ค่า calibration เริ่มต้น** map ทั้งคอลัมน์เป็น 380–700 nm (row 0 = 380 nm, row 479 = 700 nm) ผ่าน `CAL_*`; เมื่อวัดหลอด fluorescent จริงแล้วให้แก้เป็น row ของ peak 405/546 nm
+- `SPEC_NM_MIN/MAX` (380/700) ใช้ clamp ผลของ `pixelToNm()` ไม่ให้หลุดช่วงที่วัด
 - **Touch ยังไม่ยืนยันบนฮาร์ดแวร์จริง**: โค้ดสแกน `0x3B` บน Wire (SDA=21/SCL=22) ถ้าไม่เจอจะ fallback ไป BOOT อัตโนมัติ; ถ้าใช้ไม่ได้ให้ลองสแกน bus 8/7
 - `/capture` เรียก `esp_camera_fb_get()` แยกจาก loop ทำให้บางรอบ frame ถูกใช้ไป
 - Frame rate จริงจำกัดด้วย canvas flush + JPEG conversion; `FRAME_INTERVAL_MS` = 300 ms

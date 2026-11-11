@@ -111,13 +111,22 @@ Arduino_Canvas *gfx = new Arduino_Canvas(320, 480, g, 0, 0, ROTATION);
 #define COMBINE_AVERAGE       2
 #define COMBINE_MODE          COMBINE_REC709
 
-// Two-point wavelength calibration (placeholder values - replace with
-// the row indices of two known lines, e.g. a fluorescent tube's 405 nm
-// and 546 nm peaks, after measuring them on the device).
-#define CAL_PIXEL_1           40
-#define CAL_NM_1              405.0f
-#define CAL_PIXEL_2           440
-#define CAL_NM_2              546.0f
+// Two-point wavelength calibration.
+// Default (uncalibrated) mapping spreads the whole sensor column over
+// the visible range: row 0 = 380 nm, last row = 700 nm, so every graph,
+// CSV column and model input is expressed in 380-700 nm.
+// After measuring real reference lines (e.g. a fluorescent tube's
+// 405 nm and 546 nm peaks) replace CAL_PIXEL_1/2 with those row indices;
+// the axis then follows the real dispersion instead of this placeholder.
+#define CAL_PIXEL_1           0
+#define CAL_NM_1              380.0f
+#define CAL_PIXEL_2           (SPECTRUM_LEN - 1)
+#define CAL_NM_2              700.0f
+
+// Hard limits used by the pipeline/UI: values outside this window are
+// not part of the measurement.
+#define SPEC_NM_MIN           380.0f
+#define SPEC_NM_MAX           700.0f
 
 // Touch panel (AXS15231B integrated touch controller on the shared
 // Wire bus). Set TOUCH_ENABLE 0 if the controller is not detected.

@@ -59,6 +59,6 @@ python train_plsr.py --csv dataset.csv --unit "%"
 
 ## หมายเหตุ
 
-- ค่า calibration เป็น placeholder — ต้องวัดหลอด fluorescent จริง (405/546 nm)
+- ค่าเริ่มต้น map ทั้งคอลัมน์เป็น **380–700 nm** (`CAL_*`); แก้เป็นค่าที่วัดจากหลอด fluorescent จริงได้ (405/546 nm)
 - ค่าข้อมูลดิบไม่ถูก clamp; clamp เฉพาะตอนวาดบนจอ
 - เปลี่ยน exposure/gain/calibration/COMBINE_MODE แล้วต้องเก็บ dataset ใหม่
