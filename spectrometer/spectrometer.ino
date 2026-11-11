@@ -840,6 +840,7 @@ void setup() {
     gfx->flush();
 
     Serial.println("Setup complete. Starting capture...");
+    Serial.println("Serial commands: c=axis calibrate, d=dark frame, p=predict");
 }
 
 // ============================================================
@@ -992,6 +993,22 @@ void handleCalButton() {
 #endif
 }
 
+// Serial fallback so axis calibration / dark frame / predict can be run
+// from the Serial Monitor without any button.
+//   c = axis calibration, d = dark frame, p = predict
+void handleSerialCommands() {
+    while (Serial.available() > 0) {
+        int c = Serial.read();
+        if (c == 'c' || c == 'C') {
+            runAxisCalibration();
+        } else if (c == 'd' || c == 'D') {
+            runDarkFrame();
+        } else if (c == 'p' || c == 'P') {
+            triggerPrediction();
+        }
+    }
+}
+
 void handleTouchButton() {
     static unsigned long lastPoll = 0;
     static bool wasDown = false;
@@ -1052,6 +1069,7 @@ void loop() {
     handleBootButton();
     handleCalButton();
     handleTouchButton();
+    handleSerialCommands();
 
     static int frameCount = 0;
     static unsigned long fpsTimer = 0;
