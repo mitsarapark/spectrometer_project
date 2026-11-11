@@ -165,6 +165,7 @@ Axis detection (`spectrum_processing.h`):
 **Axis calibration**: `/calibrate`, ปุ่มที่สาม หรือ serial `c` → fit 20 เฟรม → median `a`,`b` → **lock + บันทึก NVS**
 (`Preferences` namespace `axis`) ค่าจึงคงอยู่ข้าม reboot และไม่มี auto-tracking มาเขียนทับ
 `/axis/auto` หรือ serial `a` = fit เฟรมเดียวแล้ว lock (one-shot, ไม่รันเอง)
+ถ้ายังไม่ตรงแนว ใช้แถบ **Axis trim** บนหน้าเว็บ (`/axis/nudge`, `/axis/set`, `/axis/reset`, `/axis/save`) ขยับ tilt/offset เองได้
 
 ---
 
@@ -172,7 +173,7 @@ Axis detection (`spectrum_processing.h`):
 
 | Path | งาน |
 |---|---|
-| `/` | หน้าเว็บ (กราฟ + ภาพกล้อง + overlay + Dataset panel) |
+| `/` | หน้าเว็บ (กราฟ + ภาพกล้อง + overlay + Axis trim + Dataset panel) |
 | `/data` | JSON: `peak`, `peakNm`, `max`, `scale`, `nmStart/End`, `axisA/B/On`, `col`, `colRange`, `modelReady`, `hasPred`, `pred`, `modelUnit`, `samples`, `fps`, `spectrum[80]` |
 | `/capture` | JPEG snapshot |
 | `/record?conc=<value>` | บันทึกแถว CSV (ปฏิเสธถ้าสเปกตรัมเก่า > 3 s) |
@@ -181,6 +182,10 @@ Axis detection (`spectrum_processing.h`):
 | `/calibrate` | เก็บ 20 เฟรม → median `a`,`b` แล้ว **lock** แนว (คืน `ok`,`locked`) |
 | `/axis` | `{"a":..,"b":..,"detected":..,"locked":..}` |
 | `/axis/auto` | fit เฟรมเดียวแล้ว lock + บันทึก NVS (one-shot) |
+| `/axis/nudge?da=<a>&db=<b>` | ขยับแนวเองทีละนิด (tilt a / offset b px) → lock + บันทึก NVS (หน่วง 1.5 s) |
+| `/axis/set?a=<a>&b=<b>` | ตั้งค่า `a`,`b` แบบ absolute → lock + บันทึก NVS |
+| `/axis/reset` | กลับเป็นเส้นตรงกลาง (`a=0`, `b=CENTER_COL`) แล้ว lock |
+| `/axis/save` | บันทึก NVS ทันที (flush ค่าที่ค้างอยู่) |
 | `/ping` | `pong` (ทดสอบเร็ว) |
 
 อื่น ๆ: captive portal redirect ทุก path ที่ไม่รู้จัก, `[443]` probe log เมื่อ browser ใช้ HTTPS

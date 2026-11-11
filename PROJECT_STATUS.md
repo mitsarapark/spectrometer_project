@@ -51,6 +51,7 @@ Camera (RGB565 VGA 640x480)
 - [x] ปุ่ม PREDICT บนจอ (touch) + BOOT สำรอง
 - [x] Auto center-line: fit `x(y)=a*y+b` ตามแนวสเปกตรัม (แก้ tilt/offset), **ไม่ track เอง** — ขยับเฉพาะตอน calibrate
 - [x] Axis calibration (ปุ่มที่สาม/`/calibrate`/serial `c`) → **lock + เก็บ NVS**, `/axis/auto` = fit เฟรมเดียวแล้ว lock
+- [x] แถบ **Axis trim** บนหน้าเว็บ: ขยับ tilt `a` / offset `b` เอง (`/axis/nudge`, `/axis/set`, `/axis/reset`, `/axis/save`) แล้ว lock + เก็บ NVS (หน่วง 1.5 s กันเขียน flash ถี่)
 - [x] เส้นเหลืองฝังในภาพ `/capture` จากเฟรมเดียวกับที่วัด (ไม่มี overlay ล่าช้าบนเว็บ)
 - [x] Captive portal + mDNS (`http://spectrometer.local`) เข้าเว็บได้ทันทีหลังต่อ WiFi
 - [x] Serial commands: `c` (axis calibrate), `a` (auto align), `d` (dark frame), `p` (predict)

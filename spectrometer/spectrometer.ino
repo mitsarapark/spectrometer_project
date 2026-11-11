@@ -266,6 +266,36 @@ h1 { color: #00d4ff; margin-bottom: 8px; }
   <div class="status" id="axisStatus">Auto-refreshes every 1 second. Yellow line = measured center, thin edges = averaged columns.</div>
 </div>
 <div class="cam-box" style="margin-top:20px">
+  <h3>Axis trim (tilt / shift)</h3>
+  <div class="status" id="trimStatus">a=-- b=--</div>
+  <div class="row">
+    <label>Tilt a</label>
+    <button class="trim" data-da="-0.005" data-db="0">-0.005</button>
+    <button class="trim" data-da="-0.001" data-db="0">-0.001</button>
+    <button class="trim" data-da="0.001" data-db="0">+0.001</button>
+    <button class="trim" data-da="0.005" data-db="0">+0.005</button>
+  </div>
+  <div class="row" style="margin-top:8px">
+    <label>Shift b</label>
+    <button class="trim" data-da="0" data-db="-10">-10 px</button>
+    <button class="trim" data-da="0" data-db="-1">-1 px</button>
+    <button class="trim" data-da="0" data-db="1">+1 px</button>
+    <button class="trim" data-da="0" data-db="10">+10 px</button>
+  </div>
+  <div class="row" style="margin-top:8px">
+    <label>Set a</label>
+    <input id="axisAInput" type="number" step="0.001" value="0" style="width:90px">
+    <label>b</label>
+    <input id="axisBInput" type="number" step="1" value="0" style="width:90px">
+    <button id="axisSetBtn">Apply</button>
+  </div>
+  <div class="row" style="margin-top:8px">
+    <button id="trimResetBtn">Reset to center</button>
+    <button id="trimSaveBtn">Save now</button>
+  </div>
+  <div class="status">Each click moves the line; check the yellow line in the snapshot. Edits are stored in flash 1.5 s after the last click.</div>
+</div>
+<div class="cam-box" style="margin-top:20px">
   <h3>ðŸ§ª Dataset</h3>
   <div class="row">
     <label for="concInput">Concentration</label>
@@ -382,6 +412,12 @@ async function update() {
             'Axis a=' + j.axisA.toFixed(4) + '  b=' + j.axisB.toFixed(1) + ' px ' +
             (j.axisLocked ? '(locked)' : '(not calibrated)') +
             ' | yellow line = measured center';
+        document.getElementById('trimStatus').textContent =
+            'a=' + j.axisA.toFixed(4) + '  b=' + j.axisB.toFixed(1) + ' px (locked)';
+        const aIn = document.getElementById('axisAInput');
+        const bIn = document.getElementById('axisBInput');
+        if (document.activeElement !== aIn) aIn.value = j.axisA.toFixed(4);
+        if (document.activeElement !== bIn) bIn.value = j.axisB.toFixed(1);
         drawSpectrum(j.spectrum, j.scale, j.nmStart, j.nmEnd);
     }catch(e){
         document.getElementById('conn').textContent='Disconnected';
@@ -455,6 +491,40 @@ document.getElementById('recordBtn').addEventListener('click', recordSample);
 document.getElementById('calBtn').addEventListener('click', calibrateAxis);
 document.getElementById('autoBtn').addEventListener('click', autoAlign);
 document.getElementById('clearBtn').addEventListener('click', clearDataset);
+
+// Manual axis trim: the device applies the delta, locks the line and
+// persists it after a short idle period, so a burst of clicks only costs
+// one flash write. The snapshot (refreshed every second) shows the result.
+async function axisCmd(url) {
+    const el = document.getElementById('trimStatus');
+    try {
+        const r = await fetch(url);
+        const j = await r.json();
+        showAxis(j);
+    } catch (e) {
+        el.textContent = 'axis trim failed';
+        el.style.color = '#ff4444';
+    }
+}
+
+function showAxis(j) {
+    const el = document.getElementById('trimStatus');
+    el.textContent = 'a=' + j.a.toFixed(4) + '  b=' + j.b.toFixed(1) + ' px (locked)';
+    el.style.color = '#00ff88';
+}
+
+document.querySelectorAll('button.trim').forEach(function (b) {
+    b.addEventListener('click', function () {
+        axisCmd('/axis/nudge?da=' + b.dataset.da + '&db=' + b.dataset.db);
+    });
+});
+document.getElementById('trimResetBtn').addEventListener('click', function () { axisCmd('/axis/reset'); });
+document.getElementById('trimSaveBtn').addEventListener('click', function () { axisCmd('/axis/save'); });
+document.getElementById('axisSetBtn').addEventListener('click', function () {
+    const a = document.getElementById('axisAInput').value;
+    const b = document.getElementById('axisBInput').value;
+    axisCmd('/axis/set?a=' + encodeURIComponent(a) + '&b=' + encodeURIComponent(b));
+});
 
 function updateCam() {
     document.getElementById('camImg').src='/capture?t='+Date.now();
@@ -795,6 +865,81 @@ void handleAxisAuto() {
     server.send(200, "application/json", out);
 }
 
+// ---------------- Manual axis trim (web) ----------------
+// Detection can land a few pixels (or a fraction of a degree) off when the
+// band is weak or partly clipped. These endpoints move/lock the calibrated
+// line by hand. Writes to NVS are deferred so a burst of clicks costs one
+// flash write instead of one per request.
+bool          axisSavePending = false;
+unsigned long axisSaveAt      = 0;
+
+static void sendAxisJson() {
+    String out = "{\"ok\":true";
+    out += ",\"a\":";
+    out += String(specSlope, 5);
+    out += ",\"b\":";
+    out += String(specIntercept, 2);
+    out += ",\"locked\":";
+    out += axisLocked ? "true" : "false";
+    out += "}";
+    server.send(200, "application/json", out);
+}
+
+// Apply a delta, keep the line inside the sensor, lock it and queue a save.
+static void axisTrimApply(float da, float db) {
+    specSlope += da;
+    specIntercept += db;
+    if (specSlope > AXIS_MAX_SLOPE)  specSlope = AXIS_MAX_SLOPE;
+    if (specSlope < -AXIS_MAX_SLOPE) specSlope = -AXIS_MAX_SLOPE;
+    axisDetected = true;
+    axisLocked   = true;
+    clampSpectrumAxis();
+    axisSavePending = true;
+    axisSaveAt = millis();
+    Serial.printf("Axis trim: a=%.4f b=%.1f\n", specSlope, specIntercept);
+}
+
+// /axis/nudge?da=<px-per-row>&db=<px>
+void handleAxisNudge() {
+    float da = server.hasArg("da") ? server.arg("da").toFloat() : 0.0f;
+    float db = server.hasArg("db") ? server.arg("db").toFloat() : 0.0f;
+    if (!isfinite(da) || !isfinite(db)) {
+        server.send(400, "application/json", "{\"ok\":false,\"err\":\"bad value\"}");
+        return;
+    }
+    axisTrimApply(da, db);
+    sendAxisJson();
+}
+
+// /axis/set?a=<a>&b=<b>  (absolute values)
+void handleAxisSet() {
+    float a = server.hasArg("a") ? server.arg("a").toFloat() : specSlope;
+    float b = server.hasArg("b") ? server.arg("b").toFloat() : specIntercept;
+    if (!isfinite(a) || !isfinite(b)) {
+        server.send(400, "application/json", "{\"ok\":false,\"err\":\"bad value\"}");
+        return;
+    }
+    specSlope = a;
+    specIntercept = b;
+    axisTrimApply(0.0f, 0.0f);
+    sendAxisJson();
+}
+
+// /axis/reset -> horizontal line through CENTER_COL
+void handleAxisReset() {
+    specSlope = 0.0f;
+    specIntercept = (float)CENTER_COL;
+    axisTrimApply(0.0f, 0.0f);
+    sendAxisJson();
+}
+
+// /axis/save -> flush a pending trim immediately
+void handleAxisSave() {
+    saveAxisCalibration();
+    axisSavePending = false;
+    sendAxisJson();
+}
+
 // ============================================================
 // SETUP
 // ============================================================
@@ -871,6 +1016,10 @@ void setup() {
     server.on("/calibrate", HTTP_GET, handleCalibrate);
     server.on("/axis", HTTP_GET, handleAxis);
     server.on("/axis/auto", HTTP_GET, handleAxisAuto);
+    server.on("/axis/nudge", HTTP_GET, handleAxisNudge);
+    server.on("/axis/set", HTTP_GET, handleAxisSet);
+    server.on("/axis/reset", HTTP_GET, handleAxisReset);
+    server.on("/axis/save", HTTP_GET, handleAxisSave);
     server.on("/ping", HTTP_GET, []() {
         server.send(200, "text/plain", "pong");
     });
@@ -1163,6 +1312,13 @@ void loop() {
     static float fps = 0;
 
     unsigned long now = millis();
+
+    // Persist a manual axis trim once the user stops clicking.
+    if (axisSavePending && now - axisSaveAt > 1500) {
+        saveAxisCalibration();
+        axisSavePending = false;
+        Serial.printf("Axis trim saved: a=%.4f b=%.1f\n", specSlope, specIntercept);
+    }
 
     // Spectrum update at a fixed interval
     if (now - lastFrameTime < FRAME_INTERVAL_MS) {
