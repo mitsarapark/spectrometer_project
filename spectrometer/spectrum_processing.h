@@ -64,13 +64,14 @@ bool  axisLocked = false;
 #define AXIS_AUTO_DETECT 0       // 0 = the line only moves on a manual calibration
 #endif
 #define AXIS_ROW_STEP       4      // sampling step in rows
-#define AXIS_MIN_ROWS       40     // need this many valid rows to trust a fit
+#define AXIS_MIN_ROWS       16     // need this many valid rows to trust a fit
+#define AXIS_MAX_GAP        6      // consecutive missed rows tolerated while walking
 #define AXIS_MAX_SLOPE      0.30f  // reject absurd tilts (px per row)
 #define AXIS_EMA_ALPHA      0.25f  // smoothing between frames (auto mode only)
 #define AXIS_MIN_BRIGHT     12     // ignore rows darker than this (0-255)
 #define AXIS_PRED_WIN       24     // +/- px searched around the predicted column
 #define AXIS_SELECT_FRACTION 0.80f // ignore peaks weaker than this * window max
-#define AXIS_PEAK_FRACTION  0.35f  // row peak must be >= this * frame peak
+#define AXIS_PEAK_FRACTION  0.15f  // row peak must be >= this * frame peak
 #define AXIS_INLIER_PX      3.0f   // points further than this from the fit are outliers
 
 static inline uint8_t pixelLuma(uint16_t p) {
@@ -270,25 +271,47 @@ bool fitSpectrumAxis(camera_fb_t *fb, float &outA, float &outB) {
     static float ptsX[maxPts];
     static uint8_t keep[maxPts];
 
-    // 1) seed
-    int gx = FRAME_WIDTH / 2;
-    int gy = FRAME_HEIGHT / 2;
+    // 1) seed: the column with the most light overall (robust against hot
+    //    pixels and short bright spots), then the brightest row near it
+    static uint32_t colSum[FRAME_WIDTH];
+    for (int x = 0; x < FRAME_WIDTH; x++) colSum[x] = 0;
     int globalPeak = 0;
-    for (int y = 0; y < FRAME_HEIGHT - 1; y += 4) {
+    for (int y = 0; y < FRAME_HEIGHT; y += 2) {
         const uint16_t *row = pix + (size_t)y * FRAME_WIDTH;
-        for (int x = 0; x < FRAME_WIDTH - 1; x += 4) {
-            int v = pixelLuma(row[x]) + pixelLuma(row[x + 1]) +
-                    pixelLuma(row[x + FRAME_WIDTH]) + pixelLuma(row[x + FRAME_WIDTH + 1]);
-            if (v > globalPeak) { globalPeak = v; gx = x; gy = y; }
+        for (int x = 0; x < FRAME_WIDTH; x++) {
+            int v = pixelLuma(row[x]);
+            colSum[x] += (uint32_t)v;
+            if (v > globalPeak) globalPeak = v;
         }
     }
-    globalPeak /= 4;
     if (globalPeak < AXIS_MIN_BRIGHT) return false;
+
+    int gx = FRAME_WIDTH / 2;
+    uint32_t bestCol = 0;
+    for (int x = 4; x < FRAME_WIDTH - 4; x++) {
+        uint32_t s = 0;
+        for (int k = -4; k <= 4; k++) s += colSum[x + k];
+        if (s > bestCol) { bestCol = s; gx = x; }
+    }
+
+    int gy = FRAME_HEIGHT / 2;
+    {
+        int sx0 = gx - 6, sx1 = gx + 6;
+        if (sx0 < 0) sx0 = 0;
+        if (sx1 > FRAME_WIDTH - 1) sx1 = FRAME_WIDTH - 1;
+        uint32_t bestRow = 0;
+        for (int y = 0; y < FRAME_HEIGHT; y += 2) {
+            const uint16_t *row = pix + (size_t)y * FRAME_WIDTH;
+            uint32_t s = 0;
+            for (int x = sx0; x <= sx1; x++) s += pixelLuma(row[x]);
+            if (s > bestRow) { bestRow = s; gy = y; }
+        }
+    }
 
     int minPeak = (int)((float)globalPeak * AXIS_PEAK_FRACTION);
     if (minPeak < AXIS_MIN_BRIGHT) minPeak = AXIS_MIN_BRIGHT;
 
-    // 2) walk away from the seed row
+    // 2) walk away from the seed row, tolerating short dark gaps
     int n = 0;
     float xc = bandCenterNear(pix, gy, (float)gx, minPeak);
     if (xc < 0.0f) return false;
@@ -297,26 +320,23 @@ bool fitSpectrumAxis(camera_fb_t *fb, float &outA, float &outB) {
     n++;
 
     float a = 0.0f, b = xc;      // running line used for the prediction
-    float xprev = xc;
 
-    for (int y = gy + AXIS_ROW_STEP; y < FRAME_HEIGHT; y += AXIS_ROW_STEP) {
-        if (n >= 3) lsLine(ptsY, ptsX, n, a, b);
-        float c = bandCenterNear(pix, y, a * (float)y + b, minPeak);
-        if (c < 0.0f || fabsf(c - xprev) > (float)AXIS_PRED_WIN) break;
-        ptsY[n] = (int16_t)y;
-        ptsX[n] = c;
-        n++;
-        xprev = c;
-    }
-    xprev = xc;
-    for (int y = gy - AXIS_ROW_STEP; y >= 0; y -= AXIS_ROW_STEP) {
-        if (n >= 3) lsLine(ptsY, ptsX, n, a, b);
-        float c = bandCenterNear(pix, y, a * (float)y + b, minPeak);
-        if (c < 0.0f || fabsf(c - xprev) > (float)AXIS_PRED_WIN) break;
-        ptsY[n] = (int16_t)y;
-        ptsX[n] = c;
-        n++;
-        xprev = c;
+    for (int dir = 1; dir >= -1; dir -= 2) {
+        int miss = 0;
+        for (int y = gy + dir * AXIS_ROW_STEP; y >= 0 && y < FRAME_HEIGHT;
+             y += dir * AXIS_ROW_STEP) {
+            if (n >= 3) lsLine(ptsY, ptsX, n, a, b);
+            float pred = a * (float)y + b;
+            float c = bandCenterNear(pix, y, pred, minPeak);
+            if (c < 0.0f || fabsf(c - pred) > (float)AXIS_PRED_WIN * 0.5f) {
+                if (++miss > AXIS_MAX_GAP) break;
+                continue;
+            }
+            miss = 0;
+            ptsY[n] = (int16_t)y;
+            ptsX[n] = c;
+            n++;
+        }
     }
 
     if (n < AXIS_MIN_ROWS) return false;
