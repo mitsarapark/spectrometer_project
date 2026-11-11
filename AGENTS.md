@@ -64,7 +64,7 @@ ml/                           เทรน PLSR บน PC
   README.md                   วิธีเก็บข้อมูล + เทรน + flash
 test/                         โค้ดทดสอบ display/camera (reference เท่านั้น)
 PROJECT_STATUS.md             สถานะ + ค่าคอนฟิก + roadmap
-problem.md                    บันทึกปัญหาที่เจอ/วิธีแก้ (P1-P8)
+problem.md                    บันทึกปัญหาที่ยังเปิดอยู่ + ข้อมูลที่ต้องเก็บ (P1-P5)
 README.md                     ภาพรวม + build/flash
 ```
 
@@ -256,7 +256,7 @@ Serial commands: c=axis calibrate (locks), d=dark frame, p=predict, a=auto align
 | อาการ | ตรวจ |
 |---|---|
 | เปิดเว็บไม่ได้ | `[ap] client connected` มีไหม, `GET /` มีไหม, `[443]` ขึ้นไหม (browser ใช้ https) |
-| บอร์ดรีบูต | `Stack canary` / panic → ดู P8 ใน `problem.md` |
+| บอร์ดรีบูต | `Stack canary` / panic → array ใหญ่บน stack (กฎใน §12) |
 | เส้นเหลืองไม่ทับแถบ | `/axis` (`detected`,`locked`), กด **Calibrate axis** / **Auto align** ใหม่, ดู `AXIS_PEAK_FRACTION` / `AXIS_PRED_WIN` |
 | dataset ไม่ขึ้น | log partition backend (LittleFS/FFat) |
 | ค่า intensity ต่ำ | ตรวจ `a`,`b` ว่าตรงแนว, tune exposure |
