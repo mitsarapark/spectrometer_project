@@ -130,10 +130,10 @@ bool fitSpectrumAxis(camera_fb_t *fb, float &outA, float &outB) {
 
     // Least squares, then one outlier-rejection pass and refit.
     float a = 0.0f, b = 0.0f;
+    float meanAbsRes = 0.0f;
     for (int pass = 0; pass < 2; pass++) {
         float sumY = 0, sumX = 0, sumYY = 0, sumXY = 0;
         int used = 0;
-        float meanAbsRes = 0.0f;
 
         for (int i = 0; i < n; i++) {
             if (pass == 1) {
@@ -169,6 +169,24 @@ bool fitSpectrumAxis(camera_fb_t *fb, float &outA, float &outB) {
     return true;
 }
 
+// Keep the fitted line inside the sensor so every sampled row still has
+// a full +/- COL_AVG_RANGE window.
+static inline void clampSpectrumAxis() {
+    const float lo = (float)COL_AVG_RANGE + 0.5f;
+    const float hi = (float)(FRAME_WIDTH - 1 - COL_AVG_RANGE) - 0.5f;
+    const float yMax = (float)(FRAME_HEIGHT - 1);
+
+    float bLo = lo - fminf(0.0f, specSlope * yMax);
+    float bHi = hi - fmaxf(0.0f, specSlope * yMax);
+    if (bLo > bHi) {
+        specSlope = 0.0f;
+        bLo = lo;
+        bHi = hi;
+    }
+    if (specIntercept < bLo) specIntercept = bLo;
+    if (specIntercept > bHi) specIntercept = bHi;
+}
+
 // Per-frame update with exponential smoothing. Keeps the previous line
 // when the frame has no usable signal.
 bool updateSpectrumAxis(camera_fb_t *fb) {
@@ -184,6 +202,7 @@ bool updateSpectrumAxis(camera_fb_t *fb) {
         specSlope += AXIS_EMA_ALPHA * (a - specSlope);
         specIntercept += AXIS_EMA_ALPHA * (b - specIntercept);
     }
+    clampSpectrumAxis();
     return true;
 #else
     (void)fb;

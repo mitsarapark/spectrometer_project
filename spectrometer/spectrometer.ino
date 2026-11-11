@@ -913,6 +913,7 @@ void runAxisCalibration() {
         specSlope = slopes[m / 2];
         specIntercept = intercepts[m / 2];
         axisDetected = true;
+        clampSpectrumAxis();
         gfx->setTextColor(GREEN);
         gfx->printf("Axis OK\n a = %+.4f\n b = %.1f px", specSlope, specIntercept);
         Serial.printf("Axis calib: a=%.4f b=%.1f (from %d frames)\n",

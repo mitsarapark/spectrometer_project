@@ -193,6 +193,36 @@ Debug exception reason: Stack canary watchpoint triggered (loopTask)
 
 ---
 
+## P10 — กด Calibrate axis แล้วขึ้น "no spectrum detected"  `FIXED`
+
+**อาการ**
+- มีแสงสเปกตรัมชัดเจนในภาพ แต่ `Calibrate axis` รายงานว่าไม่พบสเปกตรัม
+- เส้นเหลืองยังอยู่ตำแหน่งเดิม (X คงที่) แม้ปล่อยให้ระบบทำงานหลายวินาที
+
+**สาเหตุ**
+บั๊ก scope ใน `fitSpectrumAxis()`:
+```cpp
+for (int pass = 0; pass < 2; pass++) {
+    float meanAbsRes = 0.0f;   // <-- ประกาศในลูป => pass 2 รีเซ็ตเป็น 0
+```
+pass แรกคำนวณเส้นได้ถูกต้อง แต่พอ pass ที่สอง (กรอง outlier) ค่า threshold กลายเป็น 0
+→ ทุกจุดถูกกรองทิ้ง (`used = 0`) → `return false` ทุกเฟรม
+จึงไม่มีทั้งการ detect ใน loop และการ calibration
+
+**วิธีแก้**
+ย้าย `meanAbsRes` ออกมาประกาศก่อนลูป และเพิ่ม `clampSpectrumAxis()`
+เพื่อไม่ให้เส้นที่ fit หลุดขอบภาพ
+
+**ทดสอบ**
+สร้างเฟรมสังเคราะห์ 640x480 (แถบสว่างเอียง `a=0.05`, `b=320`) แล้วเรียก `fitSpectrumAxis()`
+ผลก่อนแก้: `ok=0` (used=0) — หลังแก้: `ok=1 a=0.0500 b=319.6`
+
+**หมายเหตุ**
+- ควรเทสต์ด้วยภาพจริงอีกครั้ง; ถ้ายังไม่ detect ให้ดู `GET /axis` ว่า `detected` เป็น true ไหม
+- ระหว่างที่ยังไม่ detect เส้นจะ fallback ไปที่ `CENTER_COL`
+
+---
+
 ## ข้อมูลอ้างอิง
 
 - Board: ESP32-S3-Touch-LCD-3.5B (ESP32S3 Dev Module, OPI PSRAM)
