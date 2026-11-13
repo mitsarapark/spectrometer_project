@@ -10,13 +10,23 @@
  *    CAL_PIXEL_1, CAL_NM_1, CAL_PIXEL_2, CAL_NM_2,
  *    SPEC_NM_MIN, SPEC_NM_MAX
  *
- *  Design notes (per review):
+ *  Design notes:
  *   - RGB channels are kept SEPARATE all the way through the pipeline
- *     (dark subtraction -> temporal average -> moving average). Luma
- *     (0.299R+0.587G+0.114B) is NOT used as the measurement value since
- *     it's a perceptual weighting, not an optical-power measurement.
- *     Combining into a single "display" value happens only at the very
- *     end, only for graphing.
+ *     (dark subtraction -> temporal average -> moving average).
+ *   - The measurement value defaults to the equal-weight average
+ *     (R+G+B)/3, NOT Rec.709 luma. Luma is a perceptual brightness
+ *     metric: it gives blue only 7.2 %, so a saturated blue line reads
+ *     ~18/255 while a green line reads ~183/255 even when both carry
+ *     the same optical power. That made the blue end of the spectrum
+ *     look far weaker than it is in the camera image. Rec.709/Rec.601
+ *     remain selectable for backward compatibility only.
+ *   - Combining into a single value happens only at the very end, for
+ *     graphing/CSV/model input. Real per-channel data stays intact in
+ *     spectrumSmoothR/G/B.
+ *   - The extracted spectrum is flipped at runtime (spectrumInvert) so
+ *     the graph always runs from short wavelength (blue) on the left to
+ *     long wavelength (red) on the right, regardless of how the camera
+ *     sensor is mounted.
  *   - Raw measurement data is NEVER clamped to 255. Only the
  *     visualization step (display.h) maps values into a 0..DISPLAY_MAX
  *     pixel range, so peaks above 255 are not lost from the underlying
@@ -60,6 +70,13 @@ bool  axisDetected = false;
 // line never wanders on its own; the calibrated values are stored in NVS.
 bool  axisLocked = false;
 
+// Runtime row order. SPECTRUM_INVERT is only the power-on default; the
+// actual value can be auto-detected from the red/blue ends of the frame
+// (see detectSpectrumOrientation) or flipped from the web page. Keeping
+// this separate from the compile-time macro means a sensor mounted the
+// other way round no longer needs a reflash.
+bool  spectrumInvert = (SPECTRUM_INVERT != 0);
+
 #ifndef AXIS_AUTO_DETECT
 #define AXIS_AUTO_DETECT 0       // 0 = the line only moves on a manual calibration
 #endif
@@ -74,14 +91,23 @@ bool  axisLocked = false;
 #define AXIS_PEAK_FRACTION  0.15f  // row peak must be >= this * frame peak
 #define AXIS_INLIER_PX      3.0f   // points further than this from the fit are outliers
 
-static inline uint8_t pixelLuma(uint16_t p) {
+// Brightness used by the geometric axis detector. This is the MAX of
+// the three channels, not luma: the line fit only needs to know where
+// light is, and luma made a saturated blue band (B=255 -> 18) look
+// almost dark next to a green one (G=255 -> 183). Max treats all hues
+// equally, so the detector can follow the band all the way into the
+// blue/violet end.
+static inline uint8_t pixelBrightness(uint16_t p) {
     uint8_t r = (p >> 11) & 0x1F;
     uint8_t g = (p >> 5) & 0x3F;
     uint8_t b = p & 0x1F;
     r = (r << 3) | (r >> 2);
     g = (g << 2) | (g >> 4);
     b = (b << 3) | (b >> 2);
-    return (uint8_t)(0.2126f * r + 0.7152f * g + 0.0722f * b);
+    uint8_t m = r;
+    if (g > m) m = g;
+    if (b > m) m = b;
+    return m;
 }
 
 // Center of the bright band on row y near xPred (sub-pixel), or -1 when
@@ -105,7 +131,7 @@ static float bandCenterNear(const uint16_t *pix, int y, float xPred, int minPeak
 
     int vmax = 0;
     for (int x = w0; x <= w1; x++) {
-        int v = pixelLuma(row[x]);
+        int v = pixelBrightness(row[x]);
         if (v > vmax) vmax = v;
     }
     if (vmax < minPeak) return -1.0f;
@@ -114,26 +140,26 @@ static float bandCenterNear(const uint16_t *pix, int y, float xPred, int minPeak
     int xsel = -1;
     float bestDist = 1e9f;
     for (int x = w0; x <= w1; x++) {
-        int v = pixelLuma(row[x]);
+        int v = pixelBrightness(row[x]);
         if (v < gate) continue;
-        if (x > w0 && v < pixelLuma(row[x - 1])) continue;   // not a local max
-        if (x < w1 && v < pixelLuma(row[x + 1])) continue;
+        if (x > w0 && v < pixelBrightness(row[x - 1])) continue;   // not a local max
+        if (x < w1 && v < pixelBrightness(row[x + 1])) continue;
         float d = fabsf((float)x - xPred);
         if (d < bestDist) { bestDist = d; xsel = x; }
     }
     if (xsel < 0) {   // flat window: fall back to the first maximum
         for (int x = w0; x <= w1; x++) {
-            if (pixelLuma(row[x]) >= vmax) { xsel = x; break; }
+            if (pixelBrightness(row[x]) >= vmax) { xsel = x; break; }
         }
     }
 
-    const int vsel = pixelLuma(row[xsel]);
+    const int vsel = pixelBrightness(row[xsel]);
 
     // 50 % of the peak measured above the window's darkest column, so dim
     // refracted light on one side does not lift the threshold.
     int vmin = 255;
     for (int x = w0; x <= w1; x++) {
-        int v = pixelLuma(row[x]);
+        int v = pixelBrightness(row[x]);
         if (v < vmin) vmin = v;
     }
     const float thr = (float)vmin + 0.5f * ((float)vsel - (float)vmin);
@@ -145,7 +171,7 @@ static float bandCenterNear(const uint16_t *pix, int y, float xPred, int minPeak
     {
         int vminL = vsel;
         while (xl > w0) {
-            int v = pixelLuma(row[xl - 1]);
+            int v = pixelBrightness(row[xl - 1]);
             if ((float)v < thr) break;
             if (v > vminL + 3) break;      // rose past the valley -> next peak
             if (v < vminL) vminL = v;
@@ -156,7 +182,7 @@ static float bandCenterNear(const uint16_t *pix, int y, float xPred, int minPeak
     {
         int vminR = vsel;
         while (xr < w1) {
-            int v = pixelLuma(row[xr + 1]);
+            int v = pixelBrightness(row[xr + 1]);
             if ((float)v < thr) break;
             if (v > vminR + 3) break;
             if (v < vminR) vminR = v;
@@ -172,7 +198,7 @@ static float bandCenterNear(const uint16_t *pix, int y, float xPred, int minPeak
         if (c1 > w1) c1 = w1;
         float wsum = 0.0f, xsum = 0.0f;
         for (int x = c0; x <= c1; x++) {
-            float w = (float)pixelLuma(row[x]) - (float)vmin;
+            float w = (float)pixelBrightness(row[x]) - (float)vmin;
             if (w <= 0.0f) continue;
             wsum += w;
             xsum += w * (float)x;
@@ -279,7 +305,7 @@ static bool fitSpectrumAxisWalk(camera_fb_t *fb, float &outA, float &outB) {
     for (int y = 0; y < FRAME_HEIGHT; y += 2) {
         const uint16_t *row = pix + (size_t)y * FRAME_WIDTH;
         for (int x = 0; x < FRAME_WIDTH; x++) {
-            int v = pixelLuma(row[x]);
+            int v = pixelBrightness(row[x]);
             colSum[x] += (uint32_t)v;
             if (v > globalPeak) globalPeak = v;
         }
@@ -303,7 +329,7 @@ static bool fitSpectrumAxisWalk(camera_fb_t *fb, float &outA, float &outB) {
         for (int y = 0; y < FRAME_HEIGHT; y += 2) {
             const uint16_t *row = pix + (size_t)y * FRAME_WIDTH;
             uint32_t s = 0;
-            for (int x = sx0; x <= sx1; x++) s += pixelLuma(row[x]);
+            for (int x = sx0; x <= sx1; x++) s += pixelBrightness(row[x]);
             if (s > bestRow) { bestRow = s; gy = y; }
         }
     }
@@ -375,7 +401,7 @@ static bool fitSpectrumAxisWalk(camera_fb_t *fb, float &outA, float &outB) {
 // variance (coarse sweep, then fine sweep); `b` is the half-max midpoint of
 // that peak. Uses every pixel, so short bands, noise and dim ends cannot
 // break it.
-#define AXIS_PROJ_STEP     4       // row step of the cached luma image
+#define AXIS_PROJ_STEP     4       // row step of the cached brightness image
 #define AXIS_PROJ_OFFSET   160     // profile offset (>= max |a|*FRAME_HEIGHT)
 #define AXIS_PROJ_PROFILE  (FRAME_WIDTH + 2 * AXIS_PROJ_OFFSET)
 
@@ -414,7 +440,7 @@ static bool fitSpectrumAxisProjection(camera_fb_t *fb, float &outA, float &outB)
         const uint16_t *row = pix + (size_t)(r * AXIS_PROJ_STEP) * FRAME_WIDTH;
         uint8_t *dst = L + (size_t)r * FRAME_WIDTH;
         for (int x = 0; x < FRAME_WIDTH; x++) {
-            uint8_t v = pixelLuma(row[x]);
+            uint8_t v = pixelBrightness(row[x]);
             dst[x] = v;
             if (v > globalPeak) globalPeak = v;
         }
@@ -443,7 +469,7 @@ static bool fitSpectrumAxisProjection(camera_fb_t *fb, float &outA, float &outB)
         int s = (int)lroundf(bestA * (float)y);
         uint32_t *dst = prof + AXIS_PROJ_OFFSET - s;
         const uint16_t *row = pix + (size_t)y * FRAME_WIDTH;
-        for (int x = 0; x < FRAME_WIDTH; x++) dst[x] += pixelLuma(row[x]);
+        for (int x = 0; x < FRAME_WIDTH; x++) dst[x] += pixelBrightness(row[x]);
         nrows++;
     }
 
@@ -461,7 +487,7 @@ static bool fitSpectrumAxisProjection(camera_fb_t *fb, float &outA, float &outB)
     float base = 1e30f;
     for (int i = lo; i <= hi; i++) if ((float)prof[i] < base) base = (float)prof[i];
 
-    float contrast = (pkv - base) / (float)nrows;     // mean luma above base per row
+    float contrast = (pkv - base) / (float)nrows;     // mean brightness above base per row
     if (contrast < (float)AXIS_MIN_BRIGHT * 0.5f) return false;
 
     const float thr = base + 0.5f * (pkv - base);
@@ -574,13 +600,23 @@ bool updateSpectrumAxis(camera_fb_t *fb) {
 // Reads along the fitted center line x(y) = a*y + b (averaged over
 // +/- COL_AVG_RANGE columns) down every row -> one R/G/B value per row
 // (vertical spectrum).
-// The spectrum is indexed by row: index 0 = top of the sensor image.
 // Values are NOT clamped or combined here - raw per-channel averages.
-// Set SPECTRUM_INVERT to 1 if the spectrum appears reversed (e.g. red at
-// the top instead of the bottom) so the graph reads low->high wavelength.
-void extractSpectrum(camera_fb_t *fb, float *outR, float *outG, float *outB) {
+//
+// extractSpectrumAlong() keeps the sensor row order (index 0 = top of
+// the image). extractSpectrum() applies the runtime spectrumInvert flag
+// so index 0 is always the short-wavelength (blue/violet) end.
+static void reverseSpectrum(float *v) {
+    for (int i = 0, j = SPECTRUM_LEN - 1; i < j; i++, j--) {
+        float t = v[i];
+        v[i] = v[j];
+        v[j] = t;
+    }
+}
+
+static void extractSpectrumAlong(camera_fb_t *fb, float *outR, float *outG,
+                                 float *outB, float a, float b) {
     for (int row = 0; row < FRAME_HEIGHT; row++) {
-        int center = (int)(specSlope * (float)row + specIntercept + 0.5f);
+        int center = (int)(a * (float)row + b + 0.5f);
         int colStart = center - COL_AVG_RANGE;
         int colEnd = center + COL_AVG_RANGE;
         if (colStart < 0) colStart = 0;
@@ -605,12 +641,81 @@ void extractSpectrum(camera_fb_t *fb, float *outR, float *outG, float *outB) {
             bSum += b;
         }
 
-        int outIndex = SPECTRUM_INVERT ? (FRAME_HEIGHT - 1 - row) : row;
-        outR[outIndex] = rSum / (float)numCols;
-        outG[outIndex] = gSum / (float)numCols;
-        outB[outIndex] = bSum / (float)numCols;
+        outR[row] = rSum / (float)numCols;
+        outG[row] = gSum / (float)numCols;
+        outB[row] = bSum / (float)numCols;
     }
 }
+
+void extractSpectrum(camera_fb_t *fb, float *outR, float *outG, float *outB) {
+    extractSpectrumAlong(fb, outR, outG, outB, specSlope, specIntercept);
+    if (spectrumInvert) {
+        reverseSpectrum(outR);
+        reverseSpectrum(outG);
+        reverseSpectrum(outB);
+    }
+}
+
+// ---------------- Spectrum orientation (blue end) ----------------
+// A grating spectrum has a red end and a blue end, but the camera may be
+// mounted either way round. Compare where the red/yellow light sits with
+// where the blue/cyan light sits:
+//   red at a SMALLER row than blue -> the rows run red -> blue, so the
+//   extracted array must be flipped to make index 0 the blue end.
+// Returns 1 = flip needed, 0 = current order is blue -> red, -1 = the
+// frame does not contain enough colour information to decide.
+int detectSpectrumOrientation(camera_fb_t *fb, float a, float b) {
+    static float rr[SPECTRUM_LEN], gg[SPECTRUM_LEN], bb[SPECTRUM_LEN];
+    extractSpectrumAlong(fb, rr, gg, bb, a, b);
+
+    // Remove the average dark offset per channel so a strong blue/red
+    // black level cannot drag the colour centroids around. A per-channel
+    // mean is enough here; the centroid only needs the relative order.
+    float offsetR = 0.0f, offsetG = 0.0f, offsetB = 0.0f;
+    if (darkFrameCaptured) {
+        for (int i = 0; i < SPECTRUM_LEN; i++) {
+            offsetR += darkFrameR[i];
+            offsetG += darkFrameG[i];
+            offsetB += darkFrameB[i];
+        }
+        offsetR /= (float)SPECTRUM_LEN;
+        offsetG /= (float)SPECTRUM_LEN;
+        offsetB /= (float)SPECTRUM_LEN;
+    }
+
+    float total = 0.0f;
+    float redW = 0.0f, blueW = 0.0f;
+    float redPos = 0.0f, bluePos = 0.0f;
+
+    for (int y = 0; y < FRAME_HEIGHT; y++) {
+        float r = rr[y] - offsetR; if (r < 0.0f) r = 0.0f;
+        float g = gg[y] - offsetG; if (g < 0.0f) g = 0.0f;
+        float bl = bb[y] - offsetB; if (bl < 0.0f) bl = 0.0f;
+        total += r + g + bl;
+
+        float red = r - bl;          // red/yellow side
+        if (red < 0.0f) red = 0.0f;
+        float blue = bl - r;         // blue/cyan side
+        if (blue < 0.0f) blue = 0.0f;
+
+        redW += red;
+        blueW += blue;
+        redPos += red * (float)y;
+        bluePos += blue * (float)y;
+    }
+
+    // Too dark, or the source is essentially monochromatic (a green or
+    // white LED with no visible red/blue ends) -> keep the current order.
+    if (total < 3.0f * 255.0f) return -1;
+    if (redW < total * 0.01f || blueW < total * 0.01f) return -1;
+
+    const float redCenter = redPos / redW;
+    const float blueCenter = bluePos / blueW;
+    if (fabsf(redCenter - blueCenter) < (float)FRAME_HEIGHT * 0.04f) return -1;
+
+    return (redCenter < blueCenter) ? 1 : 0;
+}
+
 
 // ---------------- Temporal buffer reset ----------------
 // Call after capturing a new dark frame (or before starting a new
@@ -627,6 +732,20 @@ void resetTemporalBuffer() {
     }
 }
 
+// Change the row order. The dark frame is stored in the same order as
+// the extracted spectrum, so it must be flipped too; the temporal ring
+// buffer holds old-orientation frames and is dropped.
+void setSpectrumInvert(bool invert) {
+    if (invert == spectrumInvert) return;
+    spectrumInvert = invert;
+    if (darkFrameCaptured) {
+        reverseSpectrum(darkFrameR);
+        reverseSpectrum(darkFrameG);
+        reverseSpectrum(darkFrameB);
+    }
+    resetTemporalBuffer();
+}
+
 // ---------------- Dark frame ----------------
 void captureDarkFrame() {
     // These buffers are static on purpose: float[480] x3 + double[480] x3
@@ -639,6 +758,7 @@ void captureDarkFrame() {
         sumR[i] = 0; sumG[i] = 0; sumB[i] = 0;
     }
 
+    int frames = 0;
     for (int f = 0; f < 8; f++) {
         camera_fb_t *fb = esp_camera_fb_get();
         if (!fb) continue;
@@ -649,12 +769,17 @@ void captureDarkFrame() {
             sumG[i] += tmpG[i];
             sumB[i] += tmpB[i];
         }
+        frames++;
         delay(100);
     }
+    if (frames == 0) {
+        Serial.println("Dark frame failed: no camera frames");
+        return;
+    }
     for (int i = 0; i < SPECTRUM_LEN; i++) {
-        darkFrameR[i] = sumR[i] / 8.0;
-        darkFrameG[i] = sumG[i] / 8.0;
-        darkFrameB[i] = sumB[i] / 8.0;
+        darkFrameR[i] = sumR[i] / (float)frames;
+        darkFrameG[i] = sumG[i] / (float)frames;
+        darkFrameB[i] = sumB[i] / (float)frames;
     }
 
     darkFrameCaptured = true;
@@ -715,27 +840,57 @@ void applyMovingAverage(float *input, float *output, int len, int window) {
 }
 
 // ---------------- Combine RGB -> single value FOR DISPLAY ONLY ----------------
-// Weights follow a standard luma definition instead of a flat average:
+// The default (COMBINE_AVERAGE) is an equal-weight average:
+//   (R + G + B) / 3
+// This is the right shape metric for a spectrum: every wavelength gets
+// the same weight regardless of its hue. Rec.709/Rec.601 are perceptual
+// luma formulas kept for comparison/backward compatibility:
 //   Rec.709 : 0.2126 R + 0.7152 G + 0.0722 B  (sRGB / HDTV)
 //   Rec.601 : 0.299  R + 0.587  G + 0.114  B  (SDTV / JPEG)
-//   Average : (R + G + B) / 3
-// Every option keeps the weights summing to 1.0, so the 0..255-ish
-// intensity range (and DISPLAY_MAX_INTENSITY) stays comparable.
-// Note: the sensor output is gamma-encoded, so true Rec.709 luma would
-// require linearising first; this is the common approximation and it is
-// applied consistently to both the LCD and the CSV dataset.
+// Rec.709 gives blue only 7.2 %, so a saturated blue line reads ~18/255
+// while a green line reads ~183/255 - that is why the blue end used to
+// look much weaker than the camera image.
+//
+// COMBINE_GAIN_R/G/B (average mode only) allow a simple per-channel
+// white-reference trim. Keep them at 1.0 until you have measured a
+// broadband reference; changing them changes the dataset scale and
+// requires retraining the PLS model.
 // Real per-channel data stays intact in spectrumSmoothR/G/B.
+#ifndef COMBINE_GAIN_R
+#define COMBINE_GAIN_R 1.0f
+#endif
+#ifndef COMBINE_GAIN_G
+#define COMBINE_GAIN_G 1.0f
+#endif
+#ifndef COMBINE_GAIN_B
+#define COMBINE_GAIN_B 1.0f
+#endif
+
 void combineForDisplay(float *r, float *g, float *b, float *out) {
 #if COMBINE_MODE == COMBINE_REC601
     const float wr = 0.299f, wg = 0.587f, wb = 0.114f;
+    const float wsum = 1.0f;
 #elif COMBINE_MODE == COMBINE_AVERAGE
-    const float wr = 1.0f / 3.0f, wg = 1.0f / 3.0f, wb = 1.0f / 3.0f;
+    const float wr = COMBINE_GAIN_R, wg = COMBINE_GAIN_G, wb = COMBINE_GAIN_B;
+    const float wsum = wr + wg + wb;
 #else
     const float wr = 0.2126f, wg = 0.7152f, wb = 0.0722f;
+    const float wsum = 1.0f;
 #endif
     for (int i = 0; i < SPECTRUM_LEN; i++) {
-        out[i] = wr * r[i] + wg * g[i] + wb * b[i];
+        out[i] = (wr * r[i] + wg * g[i] + wb * b[i]) / wsum;
     }
+}
+
+// Name of the active combine mode, for the web status line and logs.
+inline const char *combineModeName() {
+#if COMBINE_MODE == COMBINE_REC601
+    return "rec601";
+#elif COMBINE_MODE == COMBINE_AVERAGE
+    return "average";
+#else
+    return "rec709";
+#endif
 }
 
 // ---------------- Pixel index -> wavelength (2-point linear calibration) ----------------

@@ -187,9 +187,11 @@ void drawInfo(float *spectrum, float maxVal, float fps) {
 
     gfx->setCursor(10, TEXT_Y + 40);
     gfx->setTextColor(YELLOW);
-    gfx->printf("Cols:%d Tmp:%d/%d Sm:%d a:%+.3f%s",
+    gfx->printf("Cols:%d Tmp:%d/%d Sm:%d a:%+.3f%s%s",
                 COL_AVG_RANGE * 2 + 1, temporalCount, TEMPORAL_FRAMES,
-                SMOOTH_WINDOW, specSlope, axisLocked ? " LOCK" : "");
+                SMOOTH_WINDOW, specSlope,
+                axisLocked ? " LOCK" : "",
+                spectrumInvert ? " INV" : "");
 
     gfx->setCursor(10, TEXT_Y + 55);
     if (darkFrameCaptured) {

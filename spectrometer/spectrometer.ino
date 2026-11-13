@@ -97,7 +97,15 @@ Arduino_Canvas *gfx = new Arduino_Canvas(320, 480, g, 0, 0, ROTATION);
 
 // Set to 1 if the spectrum appears reversed on screen (red at the wrong
 // end); this flips the row order without touching anything else.
+// This is only the power-on default: the firmware can auto-detect the
+// blue/red ends at runtime and the web page has a Flip button, so a
+// camera mounted the other way round does not need a reflash.
 #define SPECTRUM_INVERT   0
+
+// Auto-detect the row order from the red/blue ends of the first usable
+// frame (and during axis calibration). Set to 0 to keep the compile-time
+// SPECTRUM_INVERT default until the web Flip button is used.
+#define SPECTRUM_AUTO_ORIENT 1
 
 #define TEMPORAL_FRAMES   4
 #define SMOOTH_WINDOW     7
@@ -120,10 +128,25 @@ Arduino_Canvas *gfx = new Arduino_Canvas(320, 480, g, 0, 0, ROTATION);
 
 // How the R/G/B channels are combined into the single displayed /
 // recorded intensity value (see combineForDisplay()).
+// COMBINE_AVERAGE is the default for spectrometry: it weights every
+// wavelength equally. Rec.709 luma gives blue only 7.2 %, which made a
+// bright blue band look almost flat on the graph; keep the luma modes
+// only if you deliberately want perceived-brightness values.
 #define COMBINE_REC709        0
 #define COMBINE_REC601        1
 #define COMBINE_AVERAGE       2
-#define COMBINE_MODE          COMBINE_REC709
+#define COMBINE_MODE          COMBINE_AVERAGE
+
+// Optional per-channel gains for COMBINE_AVERAGE (1.0 = no correction).
+// Only change these after measuring a broadband white reference; the
+// dataset and any trained model must be rebuilt afterwards.
+// #define COMBINE_GAIN_R     1.0f
+// #define COMBINE_GAIN_G     1.0f
+// #define COMBINE_GAIN_B     1.0f
+
+// Number of points sent to the web graph. The firmware averages each
+// bin instead of picking one sample, so narrow lines are not skipped.
+#define WEB_SPECTRUM_POINTS   160
 
 // Two-point wavelength calibration.
 // Default (uncalibrated) mapping spreads the whole sensor column over
@@ -216,6 +239,10 @@ float webPeakPos  = 0;   // peak position (pixel index), not wavelength
 float webMaxVal   = 0;   // real (unclamped) max intensity value
 float webFPS      = 0;
 
+// True once the row order came from NVS or was detected/flipped. Until
+// then the loop tries detectSpectrumOrientation() on new frames.
+bool spectrumInvertKnown = false;
+
 // ============================================================
 // HTML WEB PAGE (stored in PROGMEM)
 // ============================================================
@@ -294,6 +321,15 @@ h1 { color: #00d4ff; margin-bottom: 8px; }
     <button id="trimSaveBtn">Save now</button>
   </div>
   <div class="status">Each click moves the line; check the yellow line in the snapshot. Edits are stored in flash 1.5 s after the last click.</div>
+</div>
+<div class="cam-box" style="margin-top:20px">
+  <h3>Spectrum order (blue &lt;-&gt; red)</h3>
+  <div class="status" id="orientStatus">Order: -- | combine: --</div>
+  <div class="row">
+    <button id="flipBtn">Flip spectrum</button>
+    <button id="orientBtn">Auto detect order</button>
+  </div>
+  <div class="status">Graph x-axis must run blue (380 nm, left) to red (700 nm, right). Flip if the blue end is on the right. Auto detect looks at where the red/blue bands sit in the current frame.</div>
 </div>
 <div class="cam-box" style="margin-top:20px">
   <h3>ðŸ§ª Dataset</h3>
@@ -414,6 +450,10 @@ async function update() {
             ' | yellow line = measured center';
         document.getElementById('trimStatus').textContent =
             'a=' + j.axisA.toFixed(4) + '  b=' + j.axisB.toFixed(1) + ' px (locked)';
+        document.getElementById('orientStatus').textContent =
+            'Graph order: ' + (j.invert ? 'flipped' : 'sensor') +
+            (j.orientKnown ? ' (auto-checked)' : ' (auto-detect pending)') +
+            ' | combine: ' + j.combine;
         const aIn = document.getElementById('axisAInput');
         const bIn = document.getElementById('axisBInput');
         if (document.activeElement !== aIn) aIn.value = j.axisA.toFixed(4);
@@ -486,6 +526,35 @@ async function autoAlign() {
         el.style.color = '#ff4444';
     }
 }
+
+// Spectrum row order: the graph must read blue (380 nm) on the left and
+// red (700 nm) on the right. "Flip" reverses the extracted rows; "Auto
+// detect" uses the red/blue bands in the current frame.
+async function spectrumCmd(url, label) {
+    const el = document.getElementById('orientStatus');
+    el.textContent = label + '...';
+    el.style.color = '#ffaa00';
+    try {
+        const r = await fetch(url);
+        const j = await r.json();
+        el.textContent = j.ok
+            ? ('Graph order: ' + (j.invert ? 'flipped' : 'sensor') +
+               ' | combine: ' + j.combine)
+            : ('Order detect failed: ' + (j.err || 'no colour info'));
+        el.style.color = j.ok ? '#00ff88' : '#ff4444';
+        update();
+    } catch (e) {
+        el.textContent = 'spectrum order command failed';
+        el.style.color = '#ff4444';
+    }
+}
+
+document.getElementById('flipBtn').addEventListener('click', function () {
+    spectrumCmd('/spectrum/flip', 'flipping spectrum');
+});
+document.getElementById('orientBtn').addEventListener('click', function () {
+    spectrumCmd('/spectrum/orient', 'detecting spectrum order');
+});
 
 document.getElementById('recordBtn').addEventListener('click', recordSample);
 document.getElementById('calBtn').addEventListener('click', calibrateAxis);
@@ -590,7 +659,10 @@ bool initCamera() {
 
     s->set_brightness(s, 0);
     s->set_contrast(s, 0);
-    s->set_saturation(s, -2);
+    // 0, not -2: negative saturation mixes R/G/B (the ISP pulls every
+    // pixel towards grey), which blurs the spectral channels together.
+    // Colour purity matters more than a "natural" photo here.
+    s->set_saturation(s, 0);
     s->set_sharpness(s, -2);
     s->set_denoise(s, 0);
 
@@ -617,10 +689,12 @@ void handleRoot() {
 }
 
 void handleData() {
-    // Downsample spectrumCombined (REAL, unclamped values) to 80 points
-    // for web transfer. "scale" tells the client what range the
-    // firmware is currently displaying at on the LCD, so both stay
-    // consistent - the values themselves are never clamped.
+    // Downsample spectrumCombined (REAL, unclamped values) for web
+    // transfer. Each output point is the average of its bin, not a
+    // single sample, so a narrow line between two sampled rows is not
+    // skipped. "scale" tells the client what range the firmware is
+    // currently displaying at on the LCD; the values themselves are
+    // never clamped.
     String json = "{\"peak\":";
     json += String(webPeakPos, 0);
     json += ",\"peakNm\":";
@@ -641,6 +715,13 @@ void handleData() {
     json += axisDetected ? "true" : "false";
     json += ",\"axisLocked\":";
     json += axisLocked ? "true" : "false";
+    json += ",\"invert\":";
+    json += spectrumInvert ? "true" : "false";
+    json += ",\"orientKnown\":";
+    json += spectrumInvertKnown ? "true" : "false";
+    json += ",\"combine\":\"";
+    json += combineModeName();
+    json += "\"";
     json += ",\"col\":";
     json += String(CENTER_COL);
     json += ",\"colRange\":";
@@ -663,10 +744,20 @@ void handleData() {
     json += String(webFPS, 1);
     json += ",\"spectrum\":[";
 
-    int webPoints = 80;
+    const int webPoints = WEB_SPECTRUM_POINTS;
     for (int i = 0; i < webPoints; i++) {
-        int idx = i * SPECTRUM_LEN / webPoints;
-        json += String(spectrumCombined[idx], 1);
+        int start = i * SPECTRUM_LEN / webPoints;
+        int end = (i + 1) * SPECTRUM_LEN / webPoints;
+        if (end <= start) end = start + 1;
+        if (end > SPECTRUM_LEN) end = SPECTRUM_LEN;
+
+        float sum = 0.0f;
+        int n = 0;
+        for (int k = start; k < end; k++) {
+            sum += spectrumCombined[k];
+            n++;
+        }
+        json += String(sum / (float)n, 1);
         if (i < webPoints - 1) json += ",";
     }
     json += "]}";
@@ -787,6 +878,12 @@ void loadAxisCalibration() {
         Serial.printf("Axis loaded from NVS: a=%.4f b=%.1f (locked)\n",
                       specSlope, specIntercept);
     }
+    if (axisPrefs.isKey("inv")) {
+        setSpectrumInvert(axisPrefs.getBool("inv", false));
+        spectrumInvertKnown = true;
+        Serial.printf("Spectrum order loaded from NVS: %s\n",
+                      spectrumInvert ? "flipped (red at top)" : "normal (blue at top)");
+    }
     axisPrefs.end();
 }
 
@@ -794,7 +891,80 @@ void saveAxisCalibration() {
     axisPrefs.begin("axis", false);
     axisPrefs.putFloat("a", specSlope);
     axisPrefs.putFloat("b", specIntercept);
+    axisPrefs.putBool("inv", spectrumInvert);
     axisPrefs.end();
+}
+
+// Orientation detection needs a line that actually follows the band.
+// Before the first axis calibration, fit a temporary line from this
+// frame instead of sampling the fallback center column.
+static int detectOrientationWithFit(camera_fb_t *fb) {
+    float a = specSlope, b = specIntercept;
+    if (!axisDetected) {
+        float fitA = 0.0f, fitB = 0.0f;
+        if (fitSpectrumAxis(fb, fitA, fitB)) {
+            a = fitA;
+            b = fitB;
+        }
+    }
+    return detectSpectrumOrientation(fb, a, b);
+}
+
+// ---------------- Spectrum order endpoints (web) ----------------
+// /spectrum/flip toggles the extracted row order; /spectrum/orient runs
+// the red/blue centroid detector once. Both persist the result together
+// with the axis so the setting survives a reboot.
+static void sendSpectrumOrderJson(bool ok, const char *err) {
+    String out = "{\"ok\":";
+    out += ok ? "true" : "false";
+    out += ",\"invert\":";
+    out += spectrumInvert ? "true" : "false";
+    out += ",\"orientKnown\":";
+    out += spectrumInvertKnown ? "true" : "false";
+    out += ",\"combine\":\"";
+    out += combineModeName();
+    out += "\",\"a\":";
+    out += String(specSlope, 5);
+    out += ",\"b\":";
+    out += String(specIntercept, 2);
+    if (err != nullptr) {
+        out += ",\"err\":\"";
+        out += err;
+        out += "\"";
+    }
+    out += "}";
+    server.send(200, "application/json", out);
+}
+
+void handleSpectrumFlip() {
+    setSpectrumInvert(!spectrumInvert);
+    spectrumInvertKnown = true;
+    saveAxisCalibration();
+    Serial.printf("Spectrum order flipped: %s\n",
+                  spectrumInvert ? "red at top" : "blue at top");
+    sendSpectrumOrderJson(true, nullptr);
+}
+
+void handleSpectrumOrient() {
+    camera_fb_t *fb = esp_camera_fb_get();
+    if (!fb) {
+        sendSpectrumOrderJson(false, "camera busy");
+        return;
+    }
+    int vote = detectOrientationWithFit(fb);
+    esp_camera_fb_return(fb);
+
+    if (vote < 0) {
+        sendSpectrumOrderJson(false, "no red/blue info");
+        return;
+    }
+
+    setSpectrumInvert(vote != 0);
+    spectrumInvertKnown = true;
+    saveAxisCalibration();
+    Serial.printf("Spectrum order auto: %s\n",
+                  spectrumInvert ? "flipped (red at top)" : "normal (blue at top)");
+    sendSpectrumOrderJson(true, nullptr);
 }
 
 void handleCalibrate() {
@@ -832,6 +1002,7 @@ bool autoAlignAxis() {
 
     float a = 0.0f, b = 0.0f;
     bool ok = fitSpectrumAxis(fb, a, b);
+    int orient = ok ? detectSpectrumOrientation(fb, a, b) : -1;
     esp_camera_fb_return(fb);
 
     if (!ok) {
@@ -844,8 +1015,14 @@ bool autoAlignAxis() {
     axisDetected = true;
     axisLocked = true;
     clampSpectrumAxis();
+    if (orient >= 0) {
+        setSpectrumInvert(orient != 0);
+        spectrumInvertKnown = true;
+    }
     saveAxisCalibration();
-    Serial.printf("Auto axis: a=%.4f b=%.1f (locked)\n", specSlope, specIntercept);
+    Serial.printf("Auto axis: a=%.4f b=%.1f (locked), order=%s\n",
+                  specSlope, specIntercept,
+                  spectrumInvertKnown ? (spectrumInvert ? "flipped" : "normal") : "unchanged");
     return true;
 }
 
@@ -979,6 +1156,13 @@ void setup() {
 
     resetTemporalBuffer();
     loadAxisCalibration();
+#if !SPECTRUM_AUTO_ORIENT
+    // No runtime detection: keep the compile-time/NVS order as final.
+    spectrumInvertKnown = true;
+#endif
+    Serial.printf("Spectrum combine: %s, row order: %s\n",
+                  combineModeName(),
+                  spectrumInvertKnown ? (spectrumInvert ? "flipped" : "normal") : "auto pending");
 
     // Init WiFi AP
     WiFi.onEvent(onWiFiEvent);
@@ -1020,6 +1204,8 @@ void setup() {
     server.on("/axis/set", HTTP_GET, handleAxisSet);
     server.on("/axis/reset", HTTP_GET, handleAxisReset);
     server.on("/axis/save", HTTP_GET, handleAxisSave);
+    server.on("/spectrum/flip", HTTP_GET, handleSpectrumFlip);
+    server.on("/spectrum/orient", HTTP_GET, handleSpectrumOrient);
     server.on("/ping", HTTP_GET, []() {
         server.send(200, "text/plain", "pong");
     });
@@ -1068,7 +1254,7 @@ void setup() {
     gfx->flush();
 
     Serial.println("Setup complete. Starting capture...");
-    Serial.println("Serial commands: c=axis calibrate (locks), d=dark frame, p=predict, a=resume auto axis");
+    Serial.println("Serial commands: c=axis calibrate (locks), d=dark frame, p=predict, a=auto align, i=flip spectrum order");
 }
 
 // ============================================================
@@ -1117,6 +1303,7 @@ bool runAxisCalibration() {
     const int N = 20;
     float slopes[N], intercepts[N];
     int m = 0;
+    int orientValid = 0, orientFlip = 0;
 
     for (int i = 0; i < N; i++) {
         camera_fb_t *fb = esp_camera_fb_get();
@@ -1126,6 +1313,12 @@ bool runAxisCalibration() {
                 slopes[m] = a;
                 intercepts[m] = b;
                 m++;
+
+                int orient = detectSpectrumOrientation(fb, a, b);
+                if (orient >= 0) {
+                    orientValid++;
+                    if (orient != 0) orientFlip++;
+                }
             }
             esp_camera_fb_return(fb);
         }
@@ -1144,11 +1337,21 @@ bool runAxisCalibration() {
         axisDetected = true;
         axisLocked = true;   // freeze the line until the next calibration
         clampSpectrumAxis();
+        // Only change the row order when enough frames had both a red and
+        // a blue end; a monochromatic source must not flip the spectrum.
+        if (orientValid >= 5) {
+            setSpectrumInvert(orientFlip * 2 > orientValid);
+            spectrumInvertKnown = true;
+        }
         saveAxisCalibration();
         gfx->setTextColor(GREEN);
-        gfx->printf("Axis OK (locked)\n a = %+.4f\n b = %.1f px", specSlope, specIntercept);
-        Serial.printf("Axis calib: a=%.4f b=%.1f (from %d frames, locked)\n",
-                      specSlope, specIntercept, m);
+        gfx->printf("Axis OK (locked)\n a = %+.4f\n b = %.1f px\n order: %s",
+                    specSlope, specIntercept,
+                    spectrumInvertKnown ? (spectrumInvert ? "flipped" : "normal") : "unchanged");
+        Serial.printf("Axis calib: a=%.4f b=%.1f (from %d frames, locked), order=%s (%d/%d flipped)\n",
+                      specSlope, specIntercept, m,
+                      spectrumInvertKnown ? (spectrumInvert ? "flipped" : "normal") : "unchanged",
+                      orientFlip, orientValid);
     } else {
         gfx->setTextColor(RED);
         gfx->println("Axis calibration failed");
@@ -1229,7 +1432,7 @@ void handleCalButton() {
 // Serial fallback so axis calibration / dark frame / predict can be run
 // from the Serial Monitor without any button.
 //   c = axis calibration (locks the line), d = dark frame, p = predict,
-//   a = release the axis lock and go back to auto tracking
+//   a = auto align (fit + lock), i = flip spectrum row order
 void handleSerialCommands() {
     while (Serial.available() > 0) {
         int c = Serial.read();
@@ -1241,6 +1444,12 @@ void handleSerialCommands() {
             triggerPrediction();
         } else if (c == 'a' || c == 'A') {
             autoAlignAxis();
+        } else if (c == 'i' || c == 'I') {
+            setSpectrumInvert(!spectrumInvert);
+            spectrumInvertKnown = true;
+            saveAxisCalibration();
+            Serial.printf("Spectrum order flipped: %s\n",
+                          spectrumInvert ? "red at top" : "blue at top");
         }
     }
 }
@@ -1335,6 +1544,22 @@ void loop() {
 
     // Follow the (possibly tilted) spectrum band before sampling it.
     updateSpectrumAxis(fb);
+
+#if SPECTRUM_AUTO_ORIENT
+    // First usable frame: work out which end of the sensor is blue.
+    // Retry on later frames if this one is too dark or monochromatic.
+    if (!spectrumInvertKnown) {
+        int vote = detectOrientationWithFit(fb);
+        if (vote >= 0) {
+            setSpectrumInvert(vote != 0);
+            spectrumInvertKnown = true;
+            saveAxisCalibration();
+            Serial.printf("Spectrum order auto: %s\n",
+                          spectrumInvert ? "flipped (red at top)" : "normal (blue at top)");
+        }
+    }
+#endif
+
     extractSpectrum(fb, spectrumRawR, spectrumRawG, spectrumRawB);
     esp_camera_fb_return(fb);
 
