@@ -3,7 +3,7 @@
 คู่มือสำหรับ AI agent / ผู้พัฒนาที่กลับมาทำงานต่อในโปรเจกต์นี้
 **อ่านไฟล์นี้ก่อนแก้โค้ดทุกครั้ง** — เนื้อหาด้านล่างคือสถานะจริงของโค้ด ณ commit ล่าสุด
 
-อัปเดตล่าสุด: 2026-11-11
+อัปเดตล่าสุด: 2026-11-13
 
 ---
 
@@ -28,9 +28,10 @@
 - กล้อง RGB565 VGA + LCD + กราฟ + color bar + info
 - WiFi AP `ITIM-project` / `http://192.168.4.1` (port 80, ไม่ต้องใส่ port)
 - captive portal (เด้งหน้าเว็บเองหลังต่อ WiFi) + mDNS `http://spectrometer.local`
-- dark frame (BOOT ค้าง), temporal/moving average, Rec.709 combine
+- dark frame (BOOT ค้าง), temporal/moving average, equal-weight `(R+G+B)/3` combine
 - 2-point wavelength calibration (ค่า default 380–700 nm)
 - auto center-line: fit `x(y)=a*y+b` ตามแถบหลัก, **lock + NVS** (ไม่มี auto-track), เส้นเหลืองฝังในภาพ `/capture` จากเฟรมเดียวกัน
+- row order runtime: auto-detect ปลายน้ำเงิน (red/blue centroid) + `/spectrum/flip` + `/spectrum/orient` + serial `i`, เก็บ NVS (`inv`)
 - axis calibration (`/calibrate`, ปุ่มที่สามถ้าต่อ, serial `c`)
 - dataset CSV ลง LittleFS **หรือ** FFat (เลือกตาม partition อัตโนมัติ) + ดาวน์โหลด/ล้าง
 - PLSR training pipeline (`ml/`) + on-device dot-product inference
@@ -102,13 +103,14 @@ BOOT     : GPIO0 (INPUT_PULLUP, active LOW)
 ```
 esp_camera_fb_get() [RGB565 VGA 640x480]
   -> updateSpectrumAxis(fb)   no-op เมื่อ locked / AXIS_AUTO_DETECT=0 (แนวไม่ขยับเอง)
-  -> extractSpectrum(fb)      อ่านตามแนว x(y) ± COL_AVG_RANGE -> R/G/B ต่อ row
+  -> detectSpectrumOrientation() ครั้งแรก/ตอน calibrate (หา blue end)
+  -> extractSpectrum(fb)      อ่านตามแนว x(y) ± COL_AVG_RANGE -> R/G/B ต่อ row + flip ตาม spectrumInvert
   -> applyDarkFrameSubtraction()
   -> applyTemporalAverage()   4 เฟรม
   -> applyMovingAverage()     window 7
-  -> combineForDisplay()      Rec.709 luma
+  -> combineForDisplay()      average (R+G+B)/3
   -> LCD: drawSpectrum/drawColorBar/drawInfo/drawPredictButton -> gfx->flush()
-  -> Web: /data (JSON 80 จุด + nm + axis + model) + /capture (JPEG)
+  -> Web: /data (JSON 160 จุด + nm + axis + order + model) + /capture (JPEG)
   -> /record?conc=.. -> dataset.h -> /dataset.csv
   -> predictConcentration(): dot product บน spectrumCombined
 ```
@@ -116,6 +118,8 @@ esp_camera_fb_get() [RGB565 VGA 640x480]
 กฎสำคัญ:
 - **ห้าม clamp ข้อมูลจริง** ที่ 255; clamp เฉพาะตอนแปลงเป็นพิกัด pixel
 - RGB แยก channel ตลอด; combine เฉพาะกราฟ/CSV/โมเดล
+- combine ค่าเริ่มต้นคือ equal-weight `(R+G+B)/3` — **ห้ามใช้ Rec.709 เป็นค่า spectral power** (blue เหลือ 7.2%)
+- index 0 ของสเปกตรัมต้องเป็นปลายน้ำเงินเสมอ; ถ้าเปลี่ยน combine/gain/order ต้องเก็บ dataset ใหม่
 - `CSV_POINTS` ต้องเท่ากับ `MODEL_INPUT_DIM` (มี `#error` กันไว้)
 - การ resample ต้องใช้ grid เดียวกันทั้ง `dataset.h` และ `inference.h`
   (`i * (SPECTRUM_LEN - 1) / (N - 1)`)
@@ -129,11 +133,14 @@ esp_camera_fb_get() [RGB565 VGA 640x480]
 | `CENTER_COL` | 320 | fallback เมื่อยัง detect แนวไม่ได้ |
 | `COL_AVG_RANGE` | 10 | เฉลี่ย ±10 คอลัมน์รอบแนว |
 | `SPECTRUM_LEN` | 480 | = FRAME_HEIGHT |
-| `SPECTRUM_INVERT` | 0 | 1 = กลับลำดับ row |
+| `SPECTRUM_INVERT` | 0 | ค่าเริ่มต้นตอนบูต (runtime auto/flip ได้) |
+| `SPECTRUM_AUTO_ORIENT` | 1 | 1 = auto-detect ปลายน้ำเงินจากเฟรมแรก |
 | `TEMPORAL_FRAMES` | 4 | จำนวนเฟรมเฉลี่ย |
 | `SMOOTH_WINDOW` | 7 | moving average |
 | `FRAME_INTERVAL_MS` | 300 | คาบอัปเดต |
-| `COMBINE_MODE` | `COMBINE_REC709` | Rec.709 / Rec.601 / average |
+| `COMBINE_MODE` | `COMBINE_AVERAGE` | equal-weight `(R+G+B)/3`; Rec.709/601 เป็น legacy |
+| `COMBINE_GAIN_R/G/B` | 1.0 (ปิด) | trim ราย channel หลังวัด white reference |
+| `WEB_SPECTRUM_POINTS` | 160 | จำนวนจุดกราฟเว็บ (bin average) |
 | `CAL_PIXEL_1/2` | 0 / 479 | default เต็มคอลัมน์ |
 | `CAL_NM_1/2` | 380 / 700 | ช่วง visible (default) |
 | `SPEC_NM_MIN/MAX` | 380 / 700 | clamp ผล `pixelToNm()` |
@@ -159,13 +166,17 @@ Axis detection (`spectrum_processing.h`):
 | `AXIS_MIN_BRIGHT` | 12 | กัน noise ในเฟรมมืด |
 | `AXIS_PRED_WIN` | 24 | หน้าต่างค้นหา ±px รอบตำแหน่งที่ทำนาย |
 | `AXIS_SELECT_FRACTION` | 0.80 | เลือก peak ที่ใกล้ prediction ถ้าความสว่าง ≥ 80% ของ peak ในหน้าต่าง |
-| `AXIS_PEAK_FRACTION` | 0.35 | row peak ต้อง ≥ 35% ของ frame peak |
+| `AXIS_PEAK_FRACTION` | 0.15 | row peak ต้อง ≥ 15% ของ frame peak |
 | `AXIS_INLIER_PX` | 3.0 | เกณฑ์ outlier ของ robust fit |
 
 **Axis calibration**: `/calibrate`, ปุ่มที่สาม หรือ serial `c` → fit 20 เฟรม → median `a`,`b` → **lock + บันทึก NVS**
 (`Preferences` namespace `axis`) ค่าจึงคงอยู่ข้าม reboot และไม่มี auto-tracking มาเขียนทับ
 `/axis/auto` หรือ serial `a` = fit เฟรมเดียวแล้ว lock (one-shot, ไม่รันเอง)
 ถ้ายังไม่ตรงแนว ใช้แถบ **Axis trim** บนหน้าเว็บ (`/axis/nudge`, `/axis/set`, `/axis/reset`, `/axis/save`) ขยับ tilt/offset เองได้
+
+**Row order**: `detectSpectrumOrientation()` เทียบ centroid ของแสงแดงกับน้ำเงิน (ลบ dark offset)
+ถ้าแดงอยู่ row น้อยกว่าน้ำเงินจะ flip; ต้องมีทั้งสองปลายจึงตัดสินได้ (monochromatic → คงค่าเดิม)
+ผลถูกเก็บ NVS key `inv` พร้อม axis; `/spectrum/flip` และ serial `i` ใช้สลับเองได้
 
 ---
 
@@ -174,7 +185,7 @@ Axis detection (`spectrum_processing.h`):
 | Path | งาน |
 |---|---|
 | `/` | หน้าเว็บ (กราฟ + ภาพกล้อง + overlay + Axis trim + Dataset panel) |
-| `/data` | JSON: `peak`, `peakNm`, `max`, `scale`, `nmStart/End`, `axisA/B/On`, `col`, `colRange`, `modelReady`, `hasPred`, `pred`, `modelUnit`, `samples`, `fps`, `spectrum[80]` |
+| `/data` | JSON: `peak`, `peakNm`, `max`, `scale`, `nmStart/End`, `axisA/B/On`, `invert`, `orientKnown`, `combine`, `col`, `colRange`, `modelReady`, `hasPred`, `pred`, `modelUnit`, `samples`, `fps`, `spectrum[160]` |
 | `/capture` | JPEG snapshot |
 | `/record?conc=<value>` | บันทึกแถว CSV (ปฏิเสธถ้าสเปกตรัมเก่า > 3 s) |
 | `/dataset.csv` | ดาวน์โหลด CSV |
@@ -186,6 +197,8 @@ Axis detection (`spectrum_processing.h`):
 | `/axis/set?a=<a>&b=<b>` | ตั้งค่า `a`,`b` แบบ absolute → lock + บันทึก NVS |
 | `/axis/reset` | กลับเป็นเส้นตรงกลาง (`a=0`, `b=CENTER_COL`) แล้ว lock |
 | `/axis/save` | บันทึก NVS ทันที (flush ค่าที่ค้างอยู่) |
+| `/spectrum/flip` | สลับลำดับ row (blue↔red) + lock + NVS |
+| `/spectrum/orient` | auto-detect ปลายน้ำเงินจากเฟรมปัจจุบัน + lock + NVS |
 | `/ping` | `pong` (ทดสอบเร็ว) |
 
 อื่น ๆ: captive portal redirect ทุก path ที่ไม่รู้จัก, `[443]` probe log เมื่อ browser ใช้ HTTPS
@@ -204,6 +217,7 @@ Axis detection (`spectrum_processing.h`):
 | Serial `a` | auto align ครั้งเดียว (fit + lock + NVS) |
 | Serial `d` | dark frame |
 | Serial `p` | predict |
+| Serial `i` | flip ลำดับ row (blue↔red) + NVS |
 
 **ต้องแก้เมื่อรู้ GPIO**: `DARKFRAME_BUTTON_PIN`, `CAL_BUTTON_PIN`
 
@@ -222,7 +236,7 @@ Axis detection (`spectrum_processing.h`):
 5. คัดลอก `ml/model_weights.h` (ค่า default path คือ `spectrometer/model_weights.h`) ทับ แล้ว flash ใหม่
 6. `MODEL_READY` จะเป็น 1 → PREDICT ใช้งานได้
 
-ข้อบังคับ: เปลี่ยน exposure/gain/calibration/COMBINE_MODE/CSV_POINTS → **เก็บ dataset ใหม่และเทรนใหม่**
+ข้อบังคับ: เปลี่ยน exposure/gain/calibration/COMBINE_MODE/COMBINE_GAIN/CSV_POINTS → **เก็บ dataset ใหม่และเทรนใหม่**
 
 ---
 
@@ -252,8 +266,10 @@ FAT partition 'ffat' at 0x...... , xxxx KB
 Dataset ready: N samples in /dataset.csv
 Touch 0x3B: found
 Axis loaded from NVS: a=... b=... (locked)
+Spectrum order loaded from NVS: normal (blue at top)
+Spectrum combine: average, row order: normal
 Setup complete. Starting capture...
-Serial commands: c=axis calibrate (locks), d=dark frame, p=predict, a=auto align
+Serial commands: c=axis calibrate (locks), d=dark frame, p=predict, a=auto align, i=flip spectrum order
 [hb] up=..s stations=.. heap=..
 ```
 
@@ -265,9 +281,11 @@ Serial commands: c=axis calibrate (locks), d=dark frame, p=predict, a=auto align
 | เส้นเหลืองไม่ทับแถบ | `/axis` (`detected`,`locked`), กด **Calibrate axis** / **Auto align** ใหม่, ดู `AXIS_PEAK_FRACTION` / `AXIS_PRED_WIN` |
 | dataset ไม่ขึ้น | log partition backend (LittleFS/FFat) |
 | ค่า intensity ต่ำ | ตรวจ `a`,`b` ว่าตรงแนว, tune exposure |
+| ปลายน้ำเงินต่ำผิดปกติ/อยู่ผิดข้าง | `/data` (`invert`,`orientKnown`,`combine`), กด **Auto detect order** หรือ **Flip spectrum**; หลอดไฟต้องมีทั้งปลายแดงและน้ำเงิน |
+| สเปกตรัมกลับด้าน (แดงซ้าย) | `/spectrum/flip` หรือ serial `i`; ค่าเก็บใน NVS |
 
 เครื่องมือทดสอบ offline (ไม่ต้องมี ESP32): compile `spectrum_processing.h` ด้วย g++ + stub
-แล้วสร้างเฟรมสังเคราะห์เรียก `fitSpectrumAxis()` — ใช้ตรวจ regression ของ algorithm ได้
+แล้วสร้างเฟรมสังเคราะห์เรียก `fitSpectrumAxis()` / `detectSpectrumOrientation()` — ใช้ตรวจ regression ของ algorithm ได้
 
 ---
 
@@ -277,6 +295,9 @@ Serial commands: c=axis calibrate (locks), d=dark frame, p=predict, a=auto align
 - **ปุ่มจริงยังไม่ผูก**: BOOT อาจเสีย, ต้องตั้ง `DARKFRAME_BUTTON_PIN`/`CAL_BUTTON_PIN` ให้ตรง
 - **Stack**: ห้าม array ใหญ่ (~2 KB+) บน stack ของ loop task; ใช้ `static` (เคย crash canary)
 - ค่า calibration เป็น 380–700 แบบ uncalibrated; ต้องวัดหลอด fluorescent จริง
+- Auto row order ต้องมีทั้งปลายแดง/น้ำเงิน; แหล่ง monochromatic จะคงค่าเดิม (`orientKnown=false`)
+- ช่อง B ของกล้องอาจตอบสนองต่ำกว่า G จริง; ถ้าปลายน้ำเงินยังอ่อนเทียบ white reference ให้วัดแล้วตั้ง `COMBINE_GAIN_B` (แล้วเทรนใหม่)
+- saturation ถูกตั้งเป็น 0 เพื่อไม่ให้ ISP ผสม R/G/B; อย่าลดติดลบอีก
 - `/capture` แย่ง frame กับ loop (ยอมรับได้)
 - `MANUAL_EXPOSURE` / `MANUAL_GAIN` ยังไม่ tune
 - ยังไม่ init PMU (AXP2101) — บาง revision อาจต้องทำก่อนใช้กล้อง
@@ -331,3 +352,4 @@ Serial commands: c=axis calibrate (locks), d=dark frame, p=predict, a=auto align
 | `68ccbcd` | lock แนวเมื่อ calibrate + ย้าย touch ไป I2C 8/7 ด้วย BSP driver |
 | `177c733` | vendor Waveshare AXS15231B touch driver ใน sketch folder |
 | `b6cdeeb` | calibrate แบบ manual เท่านั้น + NVS, fit half-max midpoint, เส้นเหลืองฝังใน /capture |
+| `0ab187e` | equal-weight combine, runtime row order (auto/flip/NVS), max-channel axis brightness, saturation 0 |

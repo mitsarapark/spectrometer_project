@@ -31,7 +31,8 @@ test/                    โค้ดทดสอบ (reference เท่าน�
 
 - Dark frame capture (กด BOOT ค้าง >= 1.5 s)
 - อ่านสเปกตรัมแนวตั้งตาม **แนวกลางที่ตรวจจับอัตโนมัติ** `x(y)=a*y+b` (แก้ tilt/offset)
-- Temporal averaging + moving average, เก็บ R/G/B แยก channel, รวมด้วย Rec.709
+- Temporal averaging + moving average, เก็บ R/G/B แยก channel, รวมด้วยค่าเฉลี่ยเท่ากัน `(R+G+B)/3`
+- Auto/สลับลำดับ row ให้กราฟวิ่งน้ำเงิน (380 nm) → แดง (700 nm) ด้วย `/spectrum/flip`, `/spectrum/orient` หรือ serial `i`
 - 2-point wavelength calibration (ค่าเริ่มต้นเป็น placeholder)
 - กราฟ + color bar + peak (nm)/max/FPS บน LCD
 - WiFi AP + หน้าเว็บแสดงกราฟและภาพกล้อง พร้อมเส้น/แถบเอียงตามแนวจริง
@@ -64,4 +65,4 @@ python train_plsr.py --csv dataset.csv --unit "%"
 
 - ค่าเริ่มต้น map ทั้งคอลัมน์เป็น **380–700 nm** (`CAL_*`); แก้เป็นค่าที่วัดจากหลอด fluorescent จริงได้ (405/546 nm)
 - ค่าข้อมูลดิบไม่ถูก clamp; clamp เฉพาะตอนวาดบนจอ
-- เปลี่ยน exposure/gain/calibration/COMBINE_MODE แล้วต้องเก็บ dataset ใหม่
+- เปลี่ยน exposure/gain/calibration/COMBINE_MODE/COMBINE_GAIN แล้วต้องเก็บ dataset ใหม่

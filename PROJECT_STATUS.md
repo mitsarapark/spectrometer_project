@@ -1,6 +1,6 @@
 # PROJECT STATUS — ESP32-S3 Spectrometer
 
-อัปเดตล่าสุด: 2026-11-11
+อัปเดตล่าสุด: 2026-11-13
 
 ## 1. ภาพรวม
 
@@ -16,11 +16,12 @@
 Camera (RGB565 VGA 640x480)
    │
    ├─ updateSpectrumAxis()           track แถบหลัก + fit x(y)=a*y+b (EMA + MAD rejection)
-   ├─ extractSpectrum()              อ่านตามแนว x(y) ± COL_AVG_RANGE → R/G/B ต่อ row
+   ├─ detectSpectrumOrientation()    หาว่าปลายน้ำเงินอยู่ด้านไหนของ sensor (auto ครั้งแรก / ตอน calibrate)
+   ├─ extractSpectrum()              อ่านตามแนว x(y) ± COL_AVG_RANGE → R/G/B ต่อ row + flip ตาม spectrumInvert
    ├─ applyDarkFrameSubtraction()    ลบ baseline (ถ้าจับ dark frame แล้ว)
    ├─ applyTemporalAverage()         เฉลี่ย 4 เฟรมล่าสุด
    ├─ applyMovingAverage()           smooth window 7
-   ├─ combineForDisplay()            Rec.709 luma (0.2126R + 0.7152G + 0.0722B)
+   ├─ combineForDisplay()            ค่าเฉลี่ยเท่ากันทุกช่วงคลื่น (R+G+B)/3
    │
    ├─ LCD  : drawSpectrum + drawColorBar + drawInfo + PREDICT button
    ├─ Web  : /data (JSON) + /capture (JPEG)
@@ -31,7 +32,8 @@ Camera (RGB565 VGA 640x480)
 หลักการสำคัญ:
 - ข้อมูล R/G/B ดิบไม่ถูก clamp; clamp เฉพาะพิกัดที่วาดบนจอ
 - แกน X เป็น **nm** จาก 2-point calibration (ค่าเริ่มต้นเป็น placeholder)
-- ค่า intensity ที่ใช้ทั้งกราฟ/CSV/โมเดล คือ Rec.709 luma (สลับโหมดได้ด้วย `COMBINE_MODE`)
+- ค่า intensity ที่ใช้ทั้งกราฟ/CSV/โมเดล คือค่าเฉลี่ยเท่ากัน `(R+G+B)/3` (สลับโหมดได้ด้วย `COMBINE_MODE`)
+- ลำดับ row ถูก flip runtime ให้ index 0 = ปลายน้ำเงิน (380 nm) เสมอ; ค่าเริ่มต้นคือ `SPECTRUM_INVERT` แต่ auto-detect/เว็บปรับได้
 - สีของกราฟ/color bar อิง `wavelengthToRGB()` (cosmetic)
 
 ## 3. ฟีเจอร์ที่ทำแล้ว
@@ -40,7 +42,7 @@ Camera (RGB565 VGA 640x480)
 - [x] ดึงสเปกตรัมจากคอลัมน์กลาง (แนวตั้ง) ± ช่วงเฉลี่ย
 - [x] Dark frame capture (BOOT ค้าง) + แสดงสถานะบนจอ
 - [x] Temporal averaging + moving average
-- [x] แยก R/G/B ตลอด pipeline แล้วรวมเป็น Rec.709 เพื่อแสดงผล/บันทึก
+- [x] แยก R/G/B ตลอด pipeline แล้วรวมด้วยค่าเฉลี่ยเท่ากันเพื่อแสดงผล/บันทึก (Rec.709/Rec.601 เลือกได้แต่เป็น perceptual luma)
 - [x] กราฟ intensity vs wavelength (nm) บน LCD + color bar + peak/max/FPS
 - [x] WiFi AP (`ITIM-project`) + WebServer
 - [x] หน้าเว็บแสดงกราฟ + ภาพกล้อง + เส้น/แถบแนวตั้งบอกคอลัมน์ที่วัด
@@ -54,10 +56,13 @@ Camera (RGB565 VGA 640x480)
 - [x] แถบ **Axis trim** บนหน้าเว็บ: ขยับ tilt `a` / offset `b` เอง (`/axis/nudge`, `/axis/set`, `/axis/reset`, `/axis/save`) แล้ว lock + เก็บ NVS (หน่วง 1.5 s กันเขียน flash ถี่)
 - [x] เส้นเหลืองฝังในภาพ `/capture` จากเฟรมเดียวกับที่วัด (ไม่มี overlay ล่าช้าบนเว็บ)
 - [x] Captive portal + mDNS (`http://spectrometer.local`) เข้าเว็บได้ทันทีหลังต่อ WiFi
-- [x] Serial commands: `c` (axis calibrate), `a` (auto align), `d` (dark frame), `p` (predict)
+- [x] Serial commands: `c` (axis calibrate), `a` (auto align), `d` (dark frame), `p` (predict), `i` (flip row order)
+- [x] Auto/สลับลำดับสเปกตรัม: `SPECTRUM_AUTO_ORIENT`, `/spectrum/flip`, `/spectrum/orient`, serial `i` + เก็บลง NVS (`inv`)
 - [x] แยกแสงหักเหข้างแถบหลักออกด้วย half-max midpoint + prediction window (±`AXIS_PRED_WIN`)
 - [x] `fitSpectrumAxis()` ใช้ shear projection (fit เส้นตรงทั้งภาพ: ลองความชัน `a` แล้วเลือกที่ profile คมสุด) + refine รายแถว; ถ้าไม่เจอจะ fallback ไปวิธี walk เดิม (ทดสอบ offline กับเฟรมสังเคราะห์แล้ว ยังไม่ได้ทดสอบบนบอร์ด)
-- [x] `SPECTRUM_INVERT` สำหรับกลับลำดับ row
+- [x] `SPECTRUM_INVERT` เป็นค่าเริ่มต้นตอนบูต (runtime เปลี่ยนได้); axis detector ใช้ max(R,G,B) แทน luma เพื่อไม่ให้แถบน้ำเงินจางหาย
+- [x] เว็บกราฟเฉลี่ยเป็น bin (`WEB_SPECTRUM_POINTS` 160 จุด) แทนการสุ่มหยิบจุดเดียว
+- [x] กล้องใช้ saturation 0 (เดิม -2 ทำให้ ISP ผสม R/G/B เข้าหากัน)
 - [x] รีเฟรชทุก 300 ms (`FRAME_INTERVAL_MS`)
 
 ## 4. ค่าคอนฟิกหลัก (`spectrometer/spectrometer.ino`)
@@ -70,16 +75,19 @@ Camera (RGB565 VGA 640x480)
 | `AXIS_EMA_ALPHA` | 0.25 | ความลื่นของเส้นแนวสเปกตรัม (โหมด auto) |
 | `AXIS_PRED_WIN` | 24 px | หน้าต่างค้นหารอบตำแหน่งที่ทำนาย |
 | `AXIS_SELECT_FRACTION` | 0.80 | กันการกระโดดไป order ข้างเคียง |
-| `AXIS_PEAK_FRACTION` | 0.35 | row peak ต้อง ≥ 35% ของ frame peak |
+| `AXIS_PEAK_FRACTION` | 0.15 | row peak ต้อง ≥ 15% ของ frame peak |
 | `DARKFRAME_BUTTON_PIN` | 0 | ปุ่ม action (สั้น=predict, ค้าง=dark) |
 | `CAL_BUTTON_PIN` | -1 | ปุ่มที่สามสำหรับ axis calibration (ตั้ง GPIO เมื่อต่อปุ่ม) |
 | `COL_AVG_RANGE` | 10 | เฉลี่ย ±10 คอลัมน์ |
 | `SPECTRUM_LEN` | 480 | = FRAME_HEIGHT |
-| `SPECTRUM_INVERT` | 0 | ตั้ง 1 ถ้าสเปกตรัมกลับหัว |
+| `SPECTRUM_INVERT` | 0 | ค่าเริ่มต้นตอนบูต; runtime auto-detect/สลับได้ |
+| `SPECTRUM_AUTO_ORIENT` | 1 | 1 = หาปลายน้ำเงินอัตโนมัติจากเฟรมแรกที่ใช้ได้ |
 | `TEMPORAL_FRAMES` | 4 | จำนวนเฟรมเฉลี่ย |
 | `SMOOTH_WINDOW` | 7 | moving average |
 | `FRAME_INTERVAL_MS` | 300 | คาบอัปเดต |
-| `COMBINE_MODE` | `COMBINE_REC709` | Rec.709 / Rec.601 / average |
+| `COMBINE_MODE` | `COMBINE_AVERAGE` | equal-weight `(R+G+B)/3`; Rec.709/Rec.601 เป็น legacy |
+| `COMBINE_GAIN_R/G/B` | 1.0 (ปิด) | trim ราย channel หลังวัด white reference (ต้องเทรนใหม่) |
+| `WEB_SPECTRUM_POINTS` | 160 | จำนวนจุดกราฟเว็บ (เฉลี่ยเป็น bin) |
 | `CAL_PIXEL_1/2` | 0 / 479 | default เต็มคอลัมน์ |
 | `CAL_NM_1/2` | 380 / 700 nm | ช่วง visible; แก้เป็นค่าที่วัดจริงได้ |
 | `SPEC_NM_MIN/MAX` | 380 / 700 nm | clamp ผล `pixelToNm()` |
@@ -123,6 +131,7 @@ python train_plsr.py --csv dataset.csv --unit "%"
 ## 8. Known issues
 
 - ค่า calibration เริ่มต้น map เต็มคอลัมน์เป็น 380–700 nm — ควรวัด 405/546 nm จากหลอด fluorescent จริงแล้วแก้ `CAL_*`
+- การ auto-detect ลำดับ row ต้องมีทั้งปลายแดงและน้ำเงินในเฟรม; แหล่งกำเนิด monochromatic (เช่น LED เขียว) จะคงลำดับเดิมและรายงาน `orientKnown=false`
 - Touch: ย้ายไป bus **8/7 + Waveshare BSP** (`bsp_touch_init`) แล้ว — รอทดสอบบนฮาร์ดแวร์จริง
 - Axis calibration เก็บใน NVS (`Preferences` namespace `axis`) → คงอยู่ข้าม reboot; ถ้าย้ายแท่น/เปลี่ยนแสงต้อง calibrate ใหม่
 - **ปุ่มกายภาพยังไม่ผูกครบ**: `DARKFRAME_BUTTON_PIN = 0` (BOOT) และ `CAL_BUTTON_PIN = -1`; ต้องตั้งเมื่อรู้ GPIO จริง
@@ -131,7 +140,7 @@ python train_plsr.py --csv dataset.csv --unit "%"
 - อัตราเฟรมจำกัดจาก canvas flush + JPEG conversion
 - ยังไม่ init PMU (AXP2101); บาง revision อาจต้องทำก่อนใช้กล้อง
 - `MANUAL_EXPOSURE` / `MANUAL_GAIN` ยังไม่ tune กับแสงจริง
-- เปลี่ยน exposure/gain/calibration/COMBINE_MODE แล้ว **ต้องเก็บ dataset ใหม่และเทรนใหม่**
+- เปลี่ยน exposure/gain/calibration/COMBINE_MODE/COMBINE_GAIN แล้ว **ต้องเก็บ dataset ใหม่และเทรนใหม่**
 - `test/` เป็น reference เก่า ห้ามใช้ build หลัก
 
 ## 8.1 การเข้าเว็บ / storage
@@ -160,3 +169,5 @@ python train_plsr.py --csv dataset.csv --unit "%"
 - เพิ่ม auto center-line (track แถบหลัก + linear fit) และ axis calibration
 - แก้ stack overflow (canary) ด้วยการย้าย buffer ใหญ่เป็น static
 - ลบ `final/` (เก็บประวัติใน git)
+- เปลี่ยน combine เป็น equal-weight average + auto/runtime row order (NVS `inv`) + axis detector ใช้ max channel + saturation 0
+- เว็บกราฟเปลี่ยนเป็น bin average 160 จุด; dark frame หารด้วยจำนวนเฟรมที่สำเร็จจริง
