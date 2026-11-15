@@ -332,6 +332,23 @@ h1 { color: #00d4ff; margin-bottom: 8px; }
   <div class="status">Graph x-axis must run blue (380 nm, left) to red (700 nm, right). Flip if the blue end is on the right. Auto detect looks at where the red/blue bands sit in the current frame.</div>
 </div>
 <div class="cam-box" style="margin-top:20px">
+  <h3>Wavelength calibration</h3>
+  <div class="status" id="calStatus">Calibration: --</div>
+  <div class="row">
+    <button id="findPeaksBtn">Find peaks</button>
+    <button id="applyCalBtn">Apply calibration</button>
+    <button id="calResetBtn">Reset to default</button>
+  </div>
+  <div class="row" style="margin-top:8px">
+    <label>Manual</label>
+    <input id="calPxInput" type="number" step="0.1" placeholder="row (px)" style="width:110px">
+    <input id="calNmInput" type="number" step="0.1" placeholder="known nm" style="width:110px">
+    <button id="calAddBtn">Add point</button>
+  </div>
+  <div id="peakList"></div>
+  <div class="status" id="calMsg">Fix the blue/red order first, then turn on a lamp with known lines. Press Find peaks, type the known wavelength next to at least two peaks (or add a row manually), then Apply. Points must increase left to right; they are stored in flash.</div>
+</div>
+<div class="cam-box" style="margin-top:20px">
   <h3>ðŸ§ª Dataset</h3>
   <div class="row">
     <label for="concInput">Concentration</label>
@@ -348,6 +365,42 @@ h1 { color: #00d4ff; margin-bottom: 8px; }
 <script>
 const canvas = document.getElementById('spectrumCanvas');
 const ctx = canvas.getContext('2d');
+
+// Calibration state from /data. The x-axis labels and line colour use
+// the same piecewise map as the firmware, so a non-linear calibration
+// is drawn correctly.
+let calPoints = [];
+let specLen = 480;
+let nmLo = 380, nmHi = 700;
+let curNmStart = 380, curNmEnd = 700;
+
+function pixelToNmJs(px) {
+    let nm;
+    if (calPoints.length >= 2) {
+        const first = calPoints[0];
+        const last = calPoints[calPoints.length - 1];
+        if (px <= first[0]) {
+            nm = first[1] + (calPoints[1][1] - first[1]) *
+                 (px - first[0]) / (calPoints[1][0] - first[0]);
+        } else if (px >= last[0]) {
+            const a = calPoints[calPoints.length - 2];
+            nm = last[1] + (last[1] - a[1]) *
+                 (px - last[0]) / (last[0] - a[0]);
+        } else {
+            nm = last[1];
+            for (let i = 0; i < calPoints.length - 1; i++) {
+                const a = calPoints[i], b = calPoints[i + 1];
+                if (px >= a[0] && px <= b[0]) {
+                    nm = a[1] + (b[1] - a[1]) * (px - a[0]) / (b[0] - a[0]);
+                    break;
+                }
+            }
+        }
+    } else {
+        nm = curNmStart + (curNmEnd - curNmStart) * (px / (specLen - 1));
+    }
+    return Math.min(nmHi, Math.max(nmLo, nm));
+}
 
 // Cosmetic-only wavelength -> color mapping (380..780 nm), used for the
 // graph line and the color gradient. Values outside the visible range are
@@ -407,11 +460,11 @@ function drawSpectrum(data, scale, nmStart, nmEnd) {
         ctx.fillText(val, left-5, y+4);
     }
 
-    // X axis labels (wavelength, nm)
+    // X axis labels (wavelength, nm) - use the measured calibration map
     ctx.textAlign = 'center';
     for(let i=0;i<=8;i++){
         let x = left + (i*gw/8);
-        let nm = nmStart + (i/8)*(nmEnd-nmStart);
+        let nm = pixelToNmJs((i/8)*(specLen-1));
         ctx.fillText(Math.round(nm), x, bottom+15);
     }
     ctx.fillText('Wavelength (nm)', left+gw/2, bottom+27);
@@ -424,7 +477,7 @@ function drawSpectrum(data, scale, nmStart, nmEnd) {
         let normalized = Math.min(1, Math.max(0, data[i]/scale));
         let y = bottom - normalized*gh;
         if(prevX>=0){
-            ctx.strokeStyle = nmToRGB(nmStart + frac*(nmEnd-nmStart));
+            ctx.strokeStyle = nmToRGB(pixelToNmJs(frac*(specLen-1)));
             ctx.beginPath();ctx.moveTo(prevX,prevY);ctx.lineTo(x,y);ctx.stroke();
         }
         prevX=x; prevY=y;
@@ -454,10 +507,20 @@ async function update() {
             'Graph order: ' + (j.invert ? 'flipped' : 'sensor') +
             (j.orientKnown ? ' (auto-checked)' : ' (auto-detect pending)') +
             ' | combine: ' + j.combine;
+        document.getElementById('calStatus').textContent =
+            (j.calActive ? ('Calibration: ' + j.calCount + ' measured points')
+                         : 'Calibration: default 2-point') +
+            ' | axis ' + j.nmStart.toFixed(0) + '-' + j.nmEnd.toFixed(0) + ' nm';
         const aIn = document.getElementById('axisAInput');
         const bIn = document.getElementById('axisBInput');
         if (document.activeElement !== aIn) aIn.value = j.axisA.toFixed(4);
         if (document.activeElement !== bIn) bIn.value = j.axisB.toFixed(1);
+        specLen = j.specLen || 480;
+        nmLo = (j.nmMin !== undefined) ? j.nmMin : 380;
+        nmHi = (j.nmMax !== undefined) ? j.nmMax : 700;
+        calPoints = j.calPoints || [];
+        curNmStart = j.nmStart;
+        curNmEnd = j.nmEnd;
         drawSpectrum(j.spectrum, j.scale, j.nmStart, j.nmEnd);
     }catch(e){
         document.getElementById('conn').textContent='Disconnected';
@@ -555,6 +618,138 @@ document.getElementById('flipBtn').addEventListener('click', function () {
 document.getElementById('orientBtn').addEventListener('click', function () {
     spectrumCmd('/spectrum/orient', 'detecting spectrum order');
 });
+
+// Wavelength calibration: the firmware finds the peaks, the user types
+// the known wavelength of the reference lines, and the points are saved
+// as a piecewise-linear pixel -> nm map.
+async function findPeaks() {
+    const el = document.getElementById('calMsg');
+    el.textContent = 'finding peaks...';
+    el.style.color = '#ffaa00';
+    try {
+        const r = await fetch('/cal/peaks');
+        const j = await r.json();
+        const list = document.getElementById('peakList');
+        list.innerHTML = '';
+        if (!j.ok) throw new Error(j.err || 'failed');
+        if (!j.points || j.points.length === 0) {
+            el.textContent = 'No peaks found - check the light level and the band';
+            el.style.color = '#ff4444';
+            return;
+        }
+        j.points.forEach(function (p) {
+            const row = document.createElement('div');
+            row.className = 'row';
+            row.style.marginTop = '6px';
+            const label = document.createElement('span');
+            label.style.fontSize = '12px';
+            label.style.minWidth = '250px';
+            label.textContent = 'row ' + p.px.toFixed(1) +
+                ' | now ' + p.nm.toFixed(1) + ' nm' +
+                ' | I ' + p.val.toFixed(0);
+            const inp = document.createElement('input');
+            inp.type = 'number';
+            inp.step = '0.1';
+            inp.placeholder = 'known nm';
+            inp.dataset.px = p.px;
+            row.appendChild(label);
+            row.appendChild(inp);
+            list.appendChild(row);
+        });
+        el.textContent = 'Type the known wavelength for at least 2 lines, then Apply. Leave the others empty.';
+        el.style.color = '#00ff88';
+    } catch (e) {
+        el.textContent = 'peak search failed: ' + e.message;
+        el.style.color = '#ff4444';
+    }
+}
+
+async function applyCalibration() {
+    const el = document.getElementById('calMsg');
+    const pts = [];
+    document.querySelectorAll('#peakList input').forEach(function (inp) {
+        if (inp.value.trim() === '') return;
+        const px = parseFloat(inp.dataset.px);
+        const nm = parseFloat(inp.value);
+        if (isFinite(px) && isFinite(nm)) pts.push([px, nm]);
+    });
+    if (pts.length < 2) {
+        el.textContent = 'Enter at least 2 known wavelengths';
+        el.style.color = '#ff4444';
+        return;
+    }
+    pts.sort(function (a, b) { return a[0] - b[0]; });
+    const q = pts.map(function (p) {
+        return p[0].toFixed(2) + ':' + p[1].toFixed(1);
+    }).join(',');
+    try {
+        const r = await fetch('/cal/set?points=' + encodeURIComponent(q));
+        const j = await r.json();
+        if (!j.ok) throw new Error(j.err || 'rejected');
+        el.textContent = 'Saved: ' + j.count + ' points, ' +
+            j.nmStart.toFixed(0) + '-' + j.nmEnd.toFixed(0) + ' nm';
+        el.style.color = '#00ff88';
+        update();
+    } catch (e) {
+        el.textContent = 'calibration rejected: ' + e.message;
+        el.style.color = '#ff4444';
+    }
+}
+
+async function resetCalibration() {
+    const el = document.getElementById('calMsg');
+    try {
+        const r = await fetch('/cal/reset');
+        const j = await r.json();
+        if (!j.ok) throw new Error(j.err || 'reset failed');
+        document.getElementById('peakList').innerHTML = '';
+        el.textContent = 'Reset to the default 2-point mapping';
+        el.style.color = '#00ff88';
+        update();
+    } catch (e) {
+        el.textContent = 'reset failed: ' + e.message;
+        el.style.color = '#ff4444';
+    }
+}
+
+// Add one row/wavelength pair by hand (for a line the peak finder missed).
+async function addManualPoint() {
+    const el = document.getElementById('calMsg');
+    const px = parseFloat(document.getElementById('calPxInput').value);
+    const nm = parseFloat(document.getElementById('calNmInput').value);
+    if (!isFinite(px) || !isFinite(nm)) {
+        el.textContent = 'Enter both the row index and the known wavelength';
+        el.style.color = '#ff4444';
+        return;
+    }
+    try {
+        const cr = await fetch('/cal');
+        const cj = await cr.json();
+        const pts = (cj.points || []).slice();
+        pts.push([px, nm]);
+        pts.sort(function (a, b) { return a[0] - b[0]; });
+        const q = pts.map(function (p) {
+            return p[0].toFixed(2) + ':' + p[1].toFixed(1);
+        }).join(',');
+        const r = await fetch('/cal/set?points=' + encodeURIComponent(q));
+        const j = await r.json();
+        if (!j.ok) throw new Error(j.err || 'rejected');
+        document.getElementById('calPxInput').value = '';
+        document.getElementById('calNmInput').value = '';
+        el.textContent = 'Saved: ' + j.count + ' points, ' +
+            j.nmStart.toFixed(0) + '-' + j.nmEnd.toFixed(0) + ' nm';
+        el.style.color = '#00ff88';
+        update();
+    } catch (e) {
+        el.textContent = 'point rejected: ' + e.message;
+        el.style.color = '#ff4444';
+    }
+}
+
+document.getElementById('findPeaksBtn').addEventListener('click', findPeaks);
+document.getElementById('applyCalBtn').addEventListener('click', applyCalibration);
+document.getElementById('calResetBtn').addEventListener('click', resetCalibration);
+document.getElementById('calAddBtn').addEventListener('click', addManualPoint);
 
 document.getElementById('recordBtn').addEventListener('click', recordSample);
 document.getElementById('calBtn').addEventListener('click', calibrateAxis);
@@ -742,6 +937,26 @@ void handleData() {
     json += String(datasetSampleCount);
     json += ",\"fps\":";
     json += String(webFPS, 1);
+    json += ",\"specLen\":";
+    json += String(SPECTRUM_LEN);
+    json += ",\"nmMin\":";
+    json += String(SPEC_NM_MIN, 0);
+    json += ",\"nmMax\":";
+    json += String(SPEC_NM_MAX, 0);
+    json += ",\"calCount\":";
+    json += String(calPointCount);
+    json += ",\"calActive\":";
+    json += wavelengthCalibrationActive() ? "true" : "false";
+    json += ",\"calPoints\":[";
+    for (int i = 0; i < calPointCount; i++) {
+        if (i > 0) json += ",";
+        json += "[";
+        json += String(calPointPx[i], 2);
+        json += ",";
+        json += String(calPointNm[i], 1);
+        json += "]";
+    }
+    json += "]";
     json += ",\"spectrum\":[";
 
     const int webPoints = WEB_SPECTRUM_POINTS;
@@ -887,12 +1102,71 @@ void loadAxisCalibration() {
     axisPrefs.end();
 }
 
+void saveWavelengthCalibration();  // defined with the calibration table below
+
 void saveAxisCalibration() {
     axisPrefs.begin("axis", false);
     axisPrefs.putFloat("a", specSlope);
     axisPrefs.putFloat("b", specIntercept);
     axisPrefs.putBool("inv", spectrumInvert);
     axisPrefs.end();
+    // A row-order flip mirrors the wavelength table (setSpectrumInvert),
+    // so persist both together or a reboot would mix old/new order.
+    saveWavelengthCalibration();
+}
+
+// ---------------- Wavelength calibration (NVS) ----------------
+// The measured reference lines are stored separately from the axis so
+// either can be changed without touching the other. n=0 means "use the
+// compile-time CAL_PIXEL_*/CAL_NM_* fallback".
+static const char *CAL_PX_KEYS[] = {
+    "px0", "px1", "px2", "px3", "px4", "px5", "px6", "px7"
+};
+static const char *CAL_NM_KEYS[] = {
+    "nm0", "nm1", "nm2", "nm3", "nm4", "nm5", "nm6", "nm7"
+};
+static_assert(sizeof(CAL_PX_KEYS) / sizeof(CAL_PX_KEYS[0]) >= CAL_MAX_POINTS,
+              "CAL_MAX_POINTS must not exceed the NVS key table (8)");
+static_assert(sizeof(CAL_NM_KEYS) / sizeof(CAL_NM_KEYS[0]) >= CAL_MAX_POINTS,
+              "CAL_MAX_POINTS must not exceed the NVS key table (8)");
+
+void loadWavelengthCalibration() {
+    Preferences calPrefs;
+    if (calPrefs.begin("cal", true)) {
+        int n = calPrefs.getInt("n", 0);
+        if (n > CAL_MAX_POINTS) n = CAL_MAX_POINTS;
+        if (n > 0) {
+            float px[CAL_MAX_POINTS], nm[CAL_MAX_POINTS];
+            for (int i = 0; i < n; i++) {
+                px[i] = calPrefs.getFloat(CAL_PX_KEYS[i], 0.0f);
+                nm[i] = calPrefs.getFloat(CAL_NM_KEYS[i], 0.0f);
+            }
+            if (setWavelengthCalibration(px, nm, n)) {
+                Serial.printf("Wavelength calibration loaded: %d points, %.1f-%.1f nm\n",
+                              calPointCount, pixelToNm(0.0f),
+                              pixelToNm((float)(SPECTRUM_LEN - 1)));
+            } else {
+                clearWavelengthCalibration();
+                Serial.println("Wavelength calibration in NVS invalid - using default");
+            }
+        }
+        calPrefs.end();
+    }
+    if (!wavelengthCalibrationActive()) {
+        Serial.printf("Wavelength calibration: default 2-point (%.0f-%.0f nm)\n",
+                      pixelToNm(0.0f), pixelToNm((float)(SPECTRUM_LEN - 1)));
+    }
+}
+
+void saveWavelengthCalibration() {
+    Preferences calPrefs;
+    calPrefs.begin("cal", false);
+    calPrefs.putInt("n", calPointCount);
+    for (int i = 0; i < calPointCount; i++) {
+        calPrefs.putFloat(CAL_PX_KEYS[i], calPointPx[i]);
+        calPrefs.putFloat(CAL_NM_KEYS[i], calPointNm[i]);
+    }
+    calPrefs.end();
 }
 
 // Orientation detection needs a line that actually follows the band.
@@ -965,6 +1239,129 @@ void handleSpectrumOrient() {
     Serial.printf("Spectrum order auto: %s\n",
                   spectrumInvert ? "flipped (red at top)" : "normal (blue at top)");
     sendSpectrumOrderJson(true, nullptr);
+}
+
+// ---------------- Wavelength calibration endpoints (web) ----------------
+static void sendCalibrationJson(bool ok, const char *err) {
+    String out = "{\"ok\":";
+    out += ok ? "true" : "false";
+    out += ",\"count\":";
+    out += String(calPointCount);
+    out += ",\"active\":";
+    out += wavelengthCalibrationActive() ? "true" : "false";
+    out += ",\"nmStart\":";
+    out += String(pixelToNm(0.0f), 1);
+    out += ",\"nmEnd\":";
+    out += String(pixelToNm((float)(SPECTRUM_LEN - 1)), 1);
+    out += ",\"points\":[";
+    for (int i = 0; i < calPointCount; i++) {
+        if (i > 0) out += ",";
+        out += "[";
+        out += String(calPointPx[i], 2);
+        out += ",";
+        out += String(calPointNm[i], 1);
+        out += "]";
+    }
+    out += "]";
+    if (err != nullptr) {
+        out += ",\"err\":\"";
+        out += err;
+        out += "\"";
+    }
+    out += "}";
+    server.send(ok ? 200 : 400, "application/json", out);
+}
+
+void handleCalGet() {
+    sendCalibrationJson(true, nullptr);
+}
+
+// Detected peaks in the current (already smoothed) spectrum. The web
+// page shows them so the user only has to type the known wavelength of
+// each reference line.
+void handleCalPeaks() {
+    if (lastSpectrumMs == 0 || millis() - lastSpectrumMs > 3000) {
+        server.send(409, "application/json",
+                    "{\"ok\":false,\"err\":\"spectrum is stale\"}");
+        return;
+    }
+
+    SpectrumPeak peaks[12];
+    int n = findSpectrumPeaks(spectrumCombined, SPECTRUM_LEN, peaks, 12);
+
+    String out = "{\"ok\":true,\"count\":";
+    out += String(n);
+    out += ",\"points\":[";
+    for (int i = 0; i < n; i++) {
+        if (i > 0) out += ",";
+        out += "{\"px\":";
+        out += String(peaks[i].pos, 2);
+        out += ",\"nm\":";
+        out += String(pixelToNm(peaks[i].pos), 1);
+        out += ",\"val\":";
+        out += String(peaks[i].value, 1);
+        out += ",\"prom\":";
+        out += String(peaks[i].prominence, 1);
+        out += "}";
+    }
+    out += "]}";
+    server.send(200, "application/json", out);
+}
+
+// points=<px>:<nm>,<px>:<nm>,...   (2..CAL_MAX_POINTS pairs)
+void handleCalSet() {
+    String arg = server.arg("points");
+    if (arg.length() == 0) {
+        sendCalibrationJson(false, "missing points");
+        return;
+    }
+
+    int pairs = 1;
+    for (unsigned int i = 0; i < arg.length(); i++) {
+        if (arg[i] == ',') pairs++;
+    }
+    if (pairs > CAL_MAX_POINTS) {
+        sendCalibrationJson(false, "too many points");
+        return;
+    }
+
+    float px[CAL_MAX_POINTS], nm[CAL_MAX_POINTS];
+    int n = 0;
+    int start = 0;
+    while (start < (int)arg.length() && n < CAL_MAX_POINTS) {
+        int comma = arg.indexOf(',', start);
+        String pair = (comma < 0) ? arg.substring(start)
+                                  : arg.substring(start, comma);
+        int colon = pair.indexOf(':');
+        if (colon > 0) {
+            px[n] = pair.substring(0, colon).toFloat();
+            nm[n] = pair.substring(colon + 1).toFloat();
+            n++;
+        }
+        if (comma < 0) break;
+        start = comma + 1;
+    }
+    if (n < 2) {
+        sendCalibrationJson(false, "need at least 2 points");
+        return;
+    }
+    if (!setWavelengthCalibration(px, nm, n)) {
+        sendCalibrationJson(false, "points must increase and stay inside 380-700 nm");
+        return;
+    }
+
+    saveWavelengthCalibration();
+    Serial.printf("Wavelength calibration: %d points, %.1f-%.1f nm\n",
+                  calPointCount, pixelToNm(0.0f),
+                  pixelToNm((float)(SPECTRUM_LEN - 1)));
+    sendCalibrationJson(true, nullptr);
+}
+
+void handleCalReset() {
+    clearWavelengthCalibration();
+    saveWavelengthCalibration();
+    Serial.println("Wavelength calibration reset to default");
+    sendCalibrationJson(true, nullptr);
 }
 
 void handleCalibrate() {
@@ -1156,6 +1553,7 @@ void setup() {
 
     resetTemporalBuffer();
     loadAxisCalibration();
+    loadWavelengthCalibration();
 #if !SPECTRUM_AUTO_ORIENT
     // No runtime detection: keep the compile-time/NVS order as final.
     spectrumInvertKnown = true;
@@ -1206,6 +1604,10 @@ void setup() {
     server.on("/axis/save", HTTP_GET, handleAxisSave);
     server.on("/spectrum/flip", HTTP_GET, handleSpectrumFlip);
     server.on("/spectrum/orient", HTTP_GET, handleSpectrumOrient);
+    server.on("/cal", HTTP_GET, handleCalGet);
+    server.on("/cal/peaks", HTTP_GET, handleCalPeaks);
+    server.on("/cal/set", HTTP_GET, handleCalSet);
+    server.on("/cal/reset", HTTP_GET, handleCalReset);
     server.on("/ping", HTTP_GET, []() {
         server.send(200, "text/plain", "pong");
     });
@@ -1254,7 +1656,7 @@ void setup() {
     gfx->flush();
 
     Serial.println("Setup complete. Starting capture...");
-    Serial.println("Serial commands: c=axis calibrate (locks), d=dark frame, p=predict, a=auto align, i=flip spectrum order");
+    Serial.println("Serial commands: c=axis calibrate (locks), d=dark frame, p=predict, a=auto align, i=flip spectrum order, w=wavelength peaks");
 }
 
 // ============================================================
@@ -1432,7 +1834,28 @@ void handleCalButton() {
 // Serial fallback so axis calibration / dark frame / predict can be run
 // from the Serial Monitor without any button.
 //   c = axis calibration (locks the line), d = dark frame, p = predict,
-//   a = auto align (fit + lock), i = flip spectrum row order
+//   a = auto align (fit + lock), i = flip spectrum row order,
+//   w = wavelength calibration report (points + detected peaks)
+static void printCalibrationReport() {
+    Serial.printf("Wavelength calibration: %s, %d points\n",
+                  wavelengthCalibrationActive() ? "custom" : "default",
+                  calPointCount);
+    for (int i = 0; i < calPointCount; i++) {
+        Serial.printf("  %d: px=%.2f -> %.1f nm\n",
+                      i, calPointPx[i], calPointNm[i]);
+    }
+    SpectrumPeak peaks[12];
+    int n = findSpectrumPeaks(spectrumCombined, SPECTRUM_LEN, peaks, 12);
+    Serial.printf("Detected peaks (%d):\n", n);
+    for (int i = 0; i < n; i++) {
+        Serial.printf("  %.2f px -> %.1f nm  I=%.1f prom=%.1f\n",
+                      peaks[i].pos, pixelToNm(peaks[i].pos),
+                      peaks[i].value, peaks[i].prominence);
+    }
+    Serial.printf("Axis: %.1f-%.1f nm\n", pixelToNm(0.0f),
+                  pixelToNm((float)(SPECTRUM_LEN - 1)));
+}
+
 void handleSerialCommands() {
     while (Serial.available() > 0) {
         int c = Serial.read();
@@ -1450,6 +1873,8 @@ void handleSerialCommands() {
             saveAxisCalibration();
             Serial.printf("Spectrum order flipped: %s\n",
                           spectrumInvert ? "red at top" : "blue at top");
+        } else if (c == 'w' || c == 'W') {
+            printCalibrationReport();
         }
     }
 }

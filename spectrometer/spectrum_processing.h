@@ -10,6 +10,10 @@
  *    CAL_PIXEL_1, CAL_NM_1, CAL_PIXEL_2, CAL_NM_2,
  *    SPEC_NM_MIN, SPEC_NM_MAX
  *
+ *  CAL_PIXEL_1/2 and CAL_NM_1/2 are only the fallback 2-point mapping.
+ *  At runtime an N-point calibration table (up to CAL_MAX_POINTS) can
+ *  replace it via the web UI / NVS without reflashing.
+ *
  *  Design notes:
  *   - RGB channels are kept SEPARATE all the way through the pipeline
  *     (dark subtraction -> temporal average -> moving average).
@@ -734,7 +738,11 @@ void resetTemporalBuffer() {
 
 // Change the row order. The dark frame is stored in the same order as
 // the extracted spectrum, so it must be flipped too; the temporal ring
-// buffer holds old-orientation frames and is dropped.
+// buffer holds old-orientation frames and is dropped. A measured
+// wavelength-calibration table is stored in the same row coordinates,
+// so it is mirrored as well (defined with the table below).
+void flipWavelengthCalibration();
+
 void setSpectrumInvert(bool invert) {
     if (invert == spectrumInvert) return;
     spectrumInvert = invert;
@@ -743,6 +751,7 @@ void setSpectrumInvert(bool invert) {
         reverseSpectrum(darkFrameG);
         reverseSpectrum(darkFrameB);
     }
+    flipWavelengthCalibration();
     resetTemporalBuffer();
 }
 
@@ -893,24 +902,207 @@ inline const char *combineModeName() {
 #endif
 }
 
-// ---------------- Pixel index -> wavelength (2-point linear calibration) ----------------
-// CAL_PIXEL_1/2 are row indices and CAL_NM_1/2 the wavelengths of two
-// known lines. The default configuration maps the full sensor column to
-// 380-700 nm; replace CAL_* with measured reference lines (e.g. a
-// fluorescent tube's 405 nm and 546 nm peaks) for a real calibration.
-// Results are clamped to the SPEC_NM_MIN..SPEC_NM_MAX measured window.
+// ---------------- Wavelength calibration ----------------
+// The fallback is the compile-time 2-point mapping (CAL_PIXEL_1/2 ->
+// CAL_NM_1/2). A runtime table of up to CAL_MAX_POINTS measured lines
+// replaces it with a piecewise-linear map, so a grating's slightly
+// non-linear dispersion can be calibrated with 3+ known peaks.
+//
+// Pixel = index in the extracted spectrum (0..SPECTRUM_LEN-1, same order
+// as the graph: index 0 = blue end). Wavelengths must increase with the
+// pixel index. Results are clamped to the SPEC_NM_MIN..SPEC_NM_MAX
+// window, so calibration points must lie inside that window too.
+#ifndef CAL_MAX_POINTS
+#define CAL_MAX_POINTS 8
+#endif
+
+float calPointPx[CAL_MAX_POINTS];
+float calPointNm[CAL_MAX_POINTS];
+int   calPointCount = 0;
+
+bool wavelengthCalibrationActive() {
+    return calPointCount >= 2;
+}
+
+void clearWavelengthCalibration() {
+    calPointCount = 0;
+}
+
+// Sort by pixel, then require both pixel and wavelength to increase.
+// Returns false (and leaves the current table untouched) on bad input.
+bool setWavelengthCalibration(const float *px, const float *nm, int n) {
+    if (px == nullptr || nm == nullptr) return false;
+    if (n < 0 || n > CAL_MAX_POINTS) return false;
+
+    float tp[CAL_MAX_POINTS], tn[CAL_MAX_POINTS];
+    for (int i = 0; i < n; i++) {
+        tp[i] = px[i];
+        tn[i] = nm[i];
+    }
+    for (int i = 0; i < n - 1; i++) {
+        for (int j = 0; j < n - 1 - i; j++) {
+            if (tp[j] > tp[j + 1]) {
+                float t = tp[j]; tp[j] = tp[j + 1]; tp[j + 1] = t;
+                t = tn[j]; tn[j] = tn[j + 1]; tn[j + 1] = t;
+            }
+        }
+    }
+    for (int i = 0; i < n; i++) {
+        if (tp[i] < 0.0f || tp[i] > (float)(SPECTRUM_LEN - 1)) return false;
+        if (tn[i] < SPEC_NM_MIN || tn[i] > SPEC_NM_MAX) return false;
+        if (i > 0 && (tp[i] - tp[i - 1] < 1e-3f || tn[i] <= tn[i - 1])) return false;
+    }
+    for (int i = 0; i < n; i++) {
+        calPointPx[i] = tp[i];
+        calPointNm[i] = tn[i];
+    }
+    calPointCount = n;
+    return true;
+}
+
+// Mirror the table when the row order changes. Each pixel position is
+// reflected around the middle of the spectrum and the point order is
+// reversed so it stays ascending.
+void flipWavelengthCalibration() {
+    if (calPointCount <= 0) return;
+    for (int i = 0; i < calPointCount; i++) {
+        calPointPx[i] = (float)(SPECTRUM_LEN - 1) - calPointPx[i];
+    }
+    for (int i = 0, j = calPointCount - 1; i < j; i++, j--) {
+        float t = calPointPx[i]; calPointPx[i] = calPointPx[j]; calPointPx[j] = t;
+        t = calPointNm[i]; calPointNm[i] = calPointNm[j]; calPointNm[j] = t;
+    }
+}
+
+// Pixel index -> wavelength. Piecewise linear through the measured
+// points when at least two are stored; linear extrapolation from the
+// first/last segment outside the calibrated range.
 inline float pixelToNm(float idx) {
-    const int span = (int)CAL_PIXEL_2 - (int)CAL_PIXEL_1;
     float nm;
-    if (span == 0) {
-        nm = (float)CAL_NM_1;
+    if (calPointCount >= 2) {
+        const int last = calPointCount - 1;
+        if (idx <= calPointPx[0]) {
+            const float span = calPointPx[1] - calPointPx[0];
+            nm = calPointNm[0] +
+                 (calPointNm[1] - calPointNm[0]) * (idx - calPointPx[0]) / span;
+        } else if (idx >= calPointPx[last]) {
+            const float span = calPointPx[last] - calPointPx[last - 1];
+            nm = calPointNm[last] +
+                 (calPointNm[last] - calPointNm[last - 1]) *
+                 (idx - calPointPx[last]) / span;
+        } else {
+            int k = 0;
+            while (k < last - 1 && idx > calPointPx[k + 1]) k++;
+            const float span = calPointPx[k + 1] - calPointPx[k];
+            nm = calPointNm[k] +
+                 (calPointNm[k + 1] - calPointNm[k]) * (idx - calPointPx[k]) / span;
+        }
     } else {
-        const float slope = ((float)CAL_NM_2 - (float)CAL_NM_1) / (float)span;
-        nm = (float)CAL_NM_1 + slope * (idx - (float)CAL_PIXEL_1);
+        const int span = (int)CAL_PIXEL_2 - (int)CAL_PIXEL_1;
+        if (span == 0) {
+            nm = (float)CAL_NM_1;
+        } else {
+            const float slope = ((float)CAL_NM_2 - (float)CAL_NM_1) / (float)span;
+            nm = (float)CAL_NM_1 + slope * (idx - (float)CAL_PIXEL_1);
+        }
     }
     if (nm < SPEC_NM_MIN) nm = SPEC_NM_MIN;
     if (nm > SPEC_NM_MAX) nm = SPEC_NM_MAX;
     return nm;
+}
+
+// ---------------- Peak finder for wavelength calibration ----------------
+struct SpectrumPeak {
+    float pos;         // sub-pixel row index
+    float value;       // intensity at the peak
+    float prominence;  // height above the higher of the two valleys
+};
+
+// Finds strong local maxima and returns them left-to-right. A peak must
+// be above 6 % of the frame maximum, be at least 2 % more prominent
+// than the surrounding valleys, and be separated from stronger peaks by
+// a few rows so noisy shoulders do not produce duplicates.
+int findSpectrumPeaks(const float *spec, int len, SpectrumPeak *out, int maxPeaks) {
+    if (spec == nullptr || out == nullptr || len < 5 || maxPeaks <= 0) return 0;
+
+    float maxVal = 0.0f;
+    for (int i = 0; i < len; i++) if (spec[i] > maxVal) maxVal = spec[i];
+    if (maxVal < 4.0f) return 0;
+
+    static SpectrumPeak cand[64];
+    int nc = 0;
+    const float minVal = maxVal * 0.06f;
+
+    for (int i = 1; i < len - 1 && nc < 64; i++) {
+        if (spec[i] < minVal) continue;
+        if (spec[i] < spec[i - 1] || spec[i] < spec[i + 1]) continue;
+        if (spec[i] == spec[i - 1] && spec[i] == spec[i + 1]) continue;
+
+        // Prominence: scan outwards until the signal rises above this
+        // peak again, then take the higher of the two valley minima.
+        float leftMin = spec[i];
+        for (int j = i - 1; j >= 0; j--) {
+            if (spec[j] > spec[i]) break;
+            if (spec[j] < leftMin) leftMin = spec[j];
+        }
+        float rightMin = spec[i];
+        for (int j = i + 1; j < len; j++) {
+            if (spec[j] > spec[i]) break;
+            if (spec[j] < rightMin) rightMin = spec[j];
+        }
+        const float base = (leftMin > rightMin) ? leftMin : rightMin;
+        const float prom = spec[i] - base;
+        if (prom < maxVal * 0.02f) continue;
+
+        cand[nc].pos = (float)i;
+        cand[nc].value = spec[i];
+        cand[nc].prominence = prom;
+        nc++;
+    }
+
+    // Strongest first, then keep a minimum separation between accepted
+    // peaks (a fraction of the spectrum length).
+    for (int i = 0; i < nc - 1; i++) {
+        for (int j = 0; j < nc - 1 - i; j++) {
+            if (cand[j].prominence < cand[j + 1].prominence) {
+                SpectrumPeak t = cand[j]; cand[j] = cand[j + 1]; cand[j + 1] = t;
+            }
+        }
+    }
+
+    const int minSep = (len / 96 > 3) ? (len / 96) : 3;
+    int count = 0;
+    for (int i = 0; i < nc && count < maxPeaks; i++) {
+        bool close = false;
+        for (int j = 0; j < count; j++) {
+            if (fabsf(cand[i].pos - out[j].pos) < (float)minSep) {
+                close = true;
+                break;
+            }
+        }
+        if (!close) out[count++] = cand[i];
+    }
+
+    // Sub-pixel position from the three samples around the maximum.
+    for (int k = 0; k < count; k++) {
+        int i = (int)(out[k].pos + 0.5f);
+        if (i <= 0 || i >= len - 1) continue;
+        const float y0 = spec[i - 1], y1 = spec[i], y2 = spec[i + 1];
+        const float den = y0 - 2.0f * y1 + y2;
+        if (fabsf(den) < 1e-6f) continue;
+        const float d = 0.5f * (y0 - y2) / den;
+        if (d > -1.0f && d < 1.0f) out[k].pos = (float)i + d;
+    }
+
+    // Return left-to-right so the UI list matches the graph.
+    for (int i = 0; i < count - 1; i++) {
+        for (int j = 0; j < count - 1 - i; j++) {
+            if (out[j].pos > out[j + 1].pos) {
+                SpectrumPeak t = out[j]; out[j] = out[j + 1]; out[j + 1] = t;
+            }
+        }
+    }
+    return count;
 }
 
 // ---------------- Wavelength -> approximate visible color ----------------

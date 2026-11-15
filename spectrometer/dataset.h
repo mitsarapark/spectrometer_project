@@ -6,8 +6,9 @@
  *
  * Each recorded sample appends one CSV row to the device filesystem:
  *   nm_0,nm_1,...,nm_{K-1},concentration
- * The header holds the wavelength of every column (from the 2-point
- * calibration), data rows hold the combined intensity at that
+ * The header holds the wavelength of every column (from the active
+ * wavelength calibration: runtime N-point table, or the compile-time
+ * 2-point fallback), data rows hold the combined intensity at that
  * wavelength, and the last column is the known concentration.
  *
  * The storage backend is chosen at boot:

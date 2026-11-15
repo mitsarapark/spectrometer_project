@@ -61,7 +61,8 @@ bool initDisplay() {
     return true;
 }
 
-// x axis = wavelength (nm) from the 2-point calibration.
+// x axis = wavelength (nm) from the active calibration (runtime N-point
+// table, or the compile-time 2-point fallback).
 // y axis = intensity, scaled 0..DISPLAY_MAX_INTENSITY (this is a
 // display-only scale - the underlying data is never clamped, see
 // spectrum_processing.h).
