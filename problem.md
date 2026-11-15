@@ -1,7 +1,7 @@
 # PROBLEM LOG — ESP32-S3 Spectrometer
 
 ไฟล์นี้บันทึกปัญหาที่ยังเปิดอยู่ สาเหตุ วิธีแก้ และข้อมูลที่ต้องเก็บเพิ่ม
-อัปเดตล่าสุด: 2026-11-13
+อัปเดตล่าสุด: 2026-11-15
 
 สถานะ: `OPEN` = ยังไม่จบ, `DONE` = ยืนยันแล้ว
 รายการที่แก้แล้วให้ลบออกจากไฟล์นี้ (ประวัติยังอยู่ใน git)
@@ -12,19 +12,39 @@
 
 **อาการ**
 แกน wavelength ใช้ค่า default map เต็มคอลัมน์เป็น 380–700 nm ยังไม่ตรงกับ dispersion จริง
+(grating ไม่เป็นเชิงเส้นเป๊ะ จึงไม่ควรใช้แค่ 2 จุด)
 
-**วิธีแก้ที่วางไว้**
-วัดหลอด fluorescent หา row ของ peak 405 nm และ 546 nm แล้วแก้
-```cpp
-#define CAL_PIXEL_1  <row ของ 405 nm>
-#define CAL_NM_1     405.0f
-#define CAL_PIXEL_2  <row ของ 546 nm>
-#define CAL_NM_2     546.0f
-```
-ผลลัพธ์จะถูก clamp ในช่วง `SPEC_NM_MIN..SPEC_NM_MAX` (380–700)
+**เครื่องมือที่เพิ่มแล้ว (commit `feat: runtime N-point wavelength calibration`)**
+- `pixelToNm()` ใช้ตาราง runtime ได้สูงสุด `CAL_MAX_POINTS` = 8 จุด (piecewise-linear ผ่านทุกจุด,
+  extrapolate จาก segment หัว/ท้าย, clamp ใน `SPEC_NM_MIN..SPEC_NM_MAX`)
+- เก็บใน NVS namespace `cal` (`n`, `px0..7`, `nm0..7`) → reboot แล้วยังอยู่ ไม่ต้อง reflash
+- หน้าเว็บ **Wavelength calibration**:
+  - **Find peaks** → `/cal/peaks` หา peak sub-pixel จาก `spectrumCombined` (prominence + min separation)
+  - กรอก nm จริงตรงช่องของแต่ละเส้น (เว้นว่างได้) → **Apply calibration** → `/cal/set`
+  - **Manual** row (px) + known nm → **Add point** สำหรับเส้นที่หา peak ไม่เจอ
+  - **Reset to default** → `/cal/reset` กลับไปใช้ `CAL_*`
+- `/data` ส่ง `specLen`, `nmMin/Max`, `calCount`, `calActive`, `calPoints` → กราฟเว็บใช้ mapping เดียวกับ firmware
+- serial `w` พิมพ์ตาราง calibration + peak ที่ตรวจได้ + ช่วง nm ของแกน
+- `/spectrum/flip` และ serial `i` จะ mirror ตาราง calibration ตามลำดับ row และบันทึก axis+cal พร้อมกัน
 
-**สำคัญ**: เปลี่ยน calibration แล้วต้องเก็บ dataset ใหม่และเทรนโมเดลใหม่
-**ก่อนวัด**: ตรวจว่า `/data` ตอบ `orientKnown=true` และกราฟวิ่งน้ำเงิน→แดง (ถ้าไม่ ให้กด **Auto detect order** หรือ **Flip spectrum** ก่อน) — ลำดับ row ที่กลับด้านจะทำให้อ่านตำแหน่ง peak ผิด
+**ขั้นตอนวัดจริง**
+1. ตรวจลำดับ row ก่อน: `/data` ต้อง `orientKnown=true` และกราฟวิ่งน้ำเงิน (ซ้าย) → แดง (ขวา)
+   ถ้าไม่ กด **Auto detect order** / **Flip spectrum**
+2. โฟกัสหลอด reference ให้แถบสเปกตรัมคม (ปิด ambient light)
+3. เปิดหน้าเว็บ → **Find peaks** → เทียบจำนวน/ตำแหน่ง peak กับสเปกตรัมของหลอดนั้น
+4. กรอก nm ที่รู้ค่าลงช่องของ peak ที่ตรงกัน (อย่างน้อย 2 จุด; 3+ จุดดีกว่า) แล้ว **Apply calibration**
+5. ตรวจซ้ำ: `/data` (`calCount`, `nmStart/End`) และ serial `w`; ลองส่องหลอดอีกชนิดเทียบตำแหน่ง peak
+
+**ข้อจำกัด**
+- จุด calibration ต้องอยู่ใน 380–700 nm และต้องเพิ่มขึ้นทั้ง px และ nm; ถ้าต้องใช้ UV (เช่น 365 nm) ต้องขยาย `SPEC_NM_MIN` ก่อน
+- calibration อย่างเดียวไม่ต้องเก็บ dataset / เทรนโมเดลใหม่ เพราะ feature ยังเป็น pixel index เดิม (เปลี่ยนแค่หัวตาราง nm)
+  แต่ถ้าเปลี่ยน exposure/gain/combine/axis ต้องเก็บใหม่ตามปกติ
+
+**เกณฑ์ปิดปัญหา (acceptance)**
+1. หลอด fluorescent: peak ที่ตรวจได้ตรงกับ 405/436/546/577/579 nm ภายใน tolerances ที่ยอมรับ (~1–2 nm)
+2. `/data` ตอบ `calActive=true`, `calCount>=3` และ `nmStart/End` สมเหตุสมผล
+3. reboot แล้วตารางเดิมยังอยู่ (log `Wavelength calibration loaded: ...`)
+4. หลอดอื่น (เช่น Na หรือ Hg-Cd) peak ตรงกับค่าอ้างอิงโดยไม่ต้อง calibrate ใหม่
 
 ---
 

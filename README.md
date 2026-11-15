@@ -33,7 +33,8 @@ test/                    โค้ดทดสอบ (reference เท่าน�
 - อ่านสเปกตรัมแนวตั้งตาม **แนวกลางที่ตรวจจับอัตโนมัติ** `x(y)=a*y+b` (แก้ tilt/offset)
 - Temporal averaging + moving average, เก็บ R/G/B แยก channel, รวมด้วยค่าเฉลี่ยเท่ากัน `(R+G+B)/3`
 - Auto/สลับลำดับ row ให้กราฟวิ่งน้ำเงิน (380 nm) → แดง (700 nm) ด้วย `/spectrum/flip`, `/spectrum/orient` หรือ serial `i`
-- 2-point wavelength calibration (ค่าเริ่มต้นเป็น placeholder)
+- Runtime wavelength calibration: หา peak อัตโนมัติจากหลอด reference แล้วกรอก nm ที่รู้ค่า (2–8 จุด)
+  → piecewise-linear px→nm เก็บใน NVS; 2-point `CAL_*` เป็น fallback
 - กราฟ + color bar + peak (nm)/max/FPS บน LCD
 - WiFi AP + หน้าเว็บแสดงกราฟและภาพกล้อง พร้อมเส้น/แถบเอียงตามแนวจริง
 - Axis calibration ผ่าน `/calibrate`, serial `c` หรือปุ่มที่สาม (ถ้าต่อ)
@@ -63,6 +64,9 @@ python train_plsr.py --csv dataset.csv --unit "%"
 
 ## หมายเหตุ
 
-- ค่าเริ่มต้น map ทั้งคอลัมน์เป็น **380–700 nm** (`CAL_*`); แก้เป็นค่าที่วัดจากหลอด fluorescent จริงได้ (405/546 nm)
+- ค่าเริ่มต้น map ทั้งคอลัมน์เป็น **380–700 nm** (`CAL_*`); calibrate จริงได้จากหน้า **Wavelength calibration**
+  (ปิดไฟห้อง เปิดหลอด reference → Find peaks → กรอก nm จริง → Apply) โดยไม่ต้อง reflash
+- Calibration points ต้องอยู่ใน 380–700 nm และต้องเรียง px/nm ขึ้น; ต้องจัดลำดับ row (blue→red) ให้ถูกก่อน calibrate
+- Calibration อย่างเดียว **ไม่ต้องเทรนโมเดลใหม่** (feature ยังเป็น pixel index เดิม, เปลี่ยนแค่หัวตาราง nm)
 - ค่าข้อมูลดิบไม่ถูก clamp; clamp เฉพาะตอนวาดบนจอ
 - เปลี่ยน exposure/gain/calibration/COMBINE_MODE/COMBINE_GAIN แล้วต้องเก็บ dataset ใหม่

@@ -1,6 +1,6 @@
 # PROJECT STATUS — ESP32-S3 Spectrometer
 
-อัปเดตล่าสุด: 2026-11-13
+อัปเดตล่าสุด: 2026-11-15
 
 ## 1. ภาพรวม
 
@@ -31,7 +31,7 @@ Camera (RGB565 VGA 640x480)
 
 หลักการสำคัญ:
 - ข้อมูล R/G/B ดิบไม่ถูก clamp; clamp เฉพาะพิกัดที่วาดบนจอ
-- แกน X เป็น **nm** จาก 2-point calibration (ค่าเริ่มต้นเป็น placeholder)
+- แกน X เป็น **nm** จาก runtime N-point calibration (piecewise-linear) หรือ 2-point fallback `CAL_*`
 - ค่า intensity ที่ใช้ทั้งกราฟ/CSV/โมเดล คือค่าเฉลี่ยเท่ากัน `(R+G+B)/3` (สลับโหมดได้ด้วย `COMBINE_MODE`)
 - ลำดับ row ถูก flip runtime ให้ index 0 = ปลายน้ำเงิน (380 nm) เสมอ; ค่าเริ่มต้นคือ `SPECTRUM_INVERT` แต่ auto-detect/เว็บปรับได้
 - สีของกราฟ/color bar อิง `wavelengthToRGB()` (cosmetic)
@@ -46,7 +46,8 @@ Camera (RGB565 VGA 640x480)
 - [x] กราฟ intensity vs wavelength (nm) บน LCD + color bar + peak/max/FPS
 - [x] WiFi AP (`ITIM-project`) + WebServer
 - [x] หน้าเว็บแสดงกราฟ + ภาพกล้อง + เส้น/แถบแนวตั้งบอกคอลัมน์ที่วัด
-- [x] 2-point wavelength calibration (`CAL_PIXEL_*`, `CAL_NM_*`)
+- [x] 2-point wavelength calibration (`CAL_PIXEL_*`, `CAL_NM_*`) เป็น fallback
+- [x] Runtime N-point wavelength calibration: หา peak อัตโนมัติ/กรอกจุดเอง (px→nm) แล้ว fit piecewise-linear ผ่านทุกจุด สูงสุด 8 จุด + NVS
 - [x] เก็บ dataset CSV ลง flash (LittleFS หรือ FFat ตาม partition) ผ่านเว็บ + ดาวน์โหลด/ล้าง
 - [x] PLSR training pipeline (`ml/`) + data augmentation + export header
 - [x] On-device inference (dot product) + แสดงผลบน LCD และเว็บ
@@ -88,8 +89,9 @@ Camera (RGB565 VGA 640x480)
 | `COMBINE_MODE` | `COMBINE_AVERAGE` | equal-weight `(R+G+B)/3`; Rec.709/Rec.601 เป็น legacy |
 | `COMBINE_GAIN_R/G/B` | 1.0 (ปิด) | trim ราย channel หลังวัด white reference (ต้องเทรนใหม่) |
 | `WEB_SPECTRUM_POINTS` | 160 | จำนวนจุดกราฟเว็บ (เฉลี่ยเป็น bin) |
-| `CAL_PIXEL_1/2` | 0 / 479 | default เต็มคอลัมน์ |
-| `CAL_NM_1/2` | 380 / 700 nm | ช่วง visible; แก้เป็นค่าที่วัดจริงได้ |
+| `CAL_PIXEL_1/2` | 0 / 479 | fallback 2-point (เต็มคอลัมน์) |
+| `CAL_NM_1/2` | 380 / 700 nm | fallback 2-point (visible) |
+| `CAL_MAX_POINTS` | 8 | จำนวนจุดสูงสุดของ runtime calibration |
 | `SPEC_NM_MIN/MAX` | 380 / 700 nm | clamp ผล `pixelToNm()` |
 | `MANUAL_EXPOSURE` | 300 | ต้อง tune กับแสงจริง |
 | `MANUAL_GAIN` | 0 | ต้อง tune กับแสงจริง |
@@ -130,7 +132,8 @@ python train_plsr.py --csv dataset.csv --unit "%"
 
 ## 8. Known issues
 
-- ค่า calibration เริ่มต้น map เต็มคอลัมน์เป็น 380–700 nm — ควรวัด 405/546 nm จากหลอด fluorescent จริงแล้วแก้ `CAL_*`
+- ค่า fallback ยัง map เต็มคอลัมน์เป็น 380–700 nm — ใช้หน้า **Wavelength calibration** วัด 405/546 nm จากหลอดจริงแล้ว Apply (เก็บ NVS, ไม่ต้อง reflash)
+- Calibration points ต้องอยู่ใน 380–700 nm และเรียง px/nm ขึ้น; ต้องแก้ลำดับ row (blue→red) ก่อน calibrate
 - การ auto-detect ลำดับ row ต้องมีทั้งปลายแดงและน้ำเงินในเฟรม; แหล่งกำเนิด monochromatic (เช่น LED เขียว) จะคงลำดับเดิมและรายงาน `orientKnown=false`
 - Touch: ย้ายไป bus **8/7 + Waveshare BSP** (`bsp_touch_init`) แล้ว — รอทดสอบบนฮาร์ดแวร์จริง
 - Axis calibration เก็บใน NVS (`Preferences` namespace `axis`) → คงอยู่ข้าม reboot; ถ้าย้ายแท่น/เปลี่ยนแสงต้อง calibrate ใหม่
@@ -150,7 +153,7 @@ python train_plsr.py --csv dataset.csv --unit "%"
 
 ## 9. Roadmap
 
-1. **Calibration จริง** — วัด peak 405/546 nm แล้วแก้ `CAL_*`, ตรวจสอบกับหลอดอื่น
+1. **Calibration จริง** — วัด peak 405/546 nm แล้วกรอกผ่านหน้า Wavelength calibration (NVS, ไม่ต้อง reflash), ตรวจกับหลอดอื่น
 2. **ปรับ exposure/gain จากเว็บ** — ลดรอบ reflash ตอน tune
 3. **Dataset management** — เพิ่มการดูรายการ sample / ลบทีละแถว
 4. **โมเดลทางเลือก** — ถ้าความสัมพันธ์ไม่เป็นเชิงเส้น เปลี่ยนเป็น MLP (interface เดิม)
@@ -171,3 +174,4 @@ python train_plsr.py --csv dataset.csv --unit "%"
 - ลบ `final/` (เก็บประวัติใน git)
 - เปลี่ยน combine เป็น equal-weight average + auto/runtime row order (NVS `inv`) + axis detector ใช้ max channel + saturation 0
 - เว็บกราฟเปลี่ยนเป็น bin average 160 จุด; dark frame หารด้วยจำนวนเฟรมที่สำเร็จจริง
+- เพิ่ม runtime N-point wavelength calibration (peak finder + manual point + NVS `cal`) และกราฟใช้ mapping เดียวกับ firmware

@@ -32,6 +32,7 @@
 - 2-point wavelength calibration (ค่า default 380–700 nm)
 - auto center-line: fit `x(y)=a*y+b` ตามแถบหลัก, **lock + NVS** (ไม่มี auto-track), เส้นเหลืองฝังในภาพ `/capture` จากเฟรมเดียวกัน
 - row order runtime: auto-detect ปลายน้ำเงิน (red/blue centroid) + `/spectrum/flip` + `/spectrum/orient` + serial `i`, เก็บ NVS (`inv`)
+- wavelength calibration runtime: N-point (สูงสุด 8) px→nm ผ่านเว็บ (หา peak อัตโนมัติ/กรอกเอง) + NVS (`cal`), fallback เป็น 2-point `CAL_*`
 - axis calibration (`/calibrate`, ปุ่มที่สามถ้าต่อ, serial `c`)
 - dataset CSV ลง LittleFS **หรือ** FFat (เลือกตาม partition อัตโนมัติ) + ดาวน์โหลด/ล้าง
 - PLSR training pipeline (`ml/`) + on-device dot-product inference
@@ -109,6 +110,7 @@ esp_camera_fb_get() [RGB565 VGA 640x480]
   -> applyTemporalAverage()   4 เฟรม
   -> applyMovingAverage()     window 7
   -> combineForDisplay()      average (R+G+B)/3
+  -> pixelToNm()              N-point piecewise map (fallback 2-point) สำหรับแกน/CSV/peak
   -> LCD: drawSpectrum/drawColorBar/drawInfo/drawPredictButton -> gfx->flush()
   -> Web: /data (JSON 160 จุด + nm + axis + order + model) + /capture (JPEG)
   -> /record?conc=.. -> dataset.h -> /dataset.csv
@@ -141,8 +143,9 @@ esp_camera_fb_get() [RGB565 VGA 640x480]
 | `COMBINE_MODE` | `COMBINE_AVERAGE` | equal-weight `(R+G+B)/3`; Rec.709/601 เป็น legacy |
 | `COMBINE_GAIN_R/G/B` | 1.0 (ปิด) | trim ราย channel หลังวัด white reference |
 | `WEB_SPECTRUM_POINTS` | 160 | จำนวนจุดกราฟเว็บ (bin average) |
-| `CAL_PIXEL_1/2` | 0 / 479 | default เต็มคอลัมน์ |
-| `CAL_NM_1/2` | 380 / 700 | ช่วง visible (default) |
+| `CAL_PIXEL_1/2` | 0 / 479 | fallback 2-point (เต็มคอลัมน์) |
+| `CAL_NM_1/2` | 380 / 700 | fallback 2-point (visible) |
+| `CAL_MAX_POINTS` | 8 | จำนวนจุดสูงสุดของ runtime calibration (NVS `cal`) |
 | `SPEC_NM_MIN/MAX` | 380 / 700 | clamp ผล `pixelToNm()` |
 | `MANUAL_EXPOSURE` | 300 | tune กับแสงจริง |
 | `MANUAL_GAIN` | 0 | tune กับแสงจริง |
@@ -178,6 +181,14 @@ Axis detection (`spectrum_processing.h`):
 ถ้าแดงอยู่ row น้อยกว่าน้ำเงินจะ flip; ต้องมีทั้งสองปลายจึงตัดสินได้ (monochromatic → คงค่าเดิม)
 ผลถูกเก็บ NVS key `inv` พร้อม axis; `/spectrum/flip` และ serial `i` ใช้สลับเองได้
 
+**Wavelength calibration**: ถ้ามีจุด calibrate ≥2 จุดใน NVS (`cal`) `pixelToNm()` จะใช้ piecewise-linear
+ผ่านจุดที่วัด (ไม่ใช่ 2-point เดิม) ทำให้ dispersion ที่ไม่เป็นเชิงเส้นตรงขึ้น; ถ้าไม่มีจะ fallback ไป `CAL_*`
+- `/cal/peaks` หา peak จาก `spectrumCombined` (sub-pixel, prominence, แยกกันอย่างน้อย ~5 row)
+- `/cal/set?points=<px>:<nm>,...` บันทึก 2-8 จุด (px/nma ต้องเพิ่มขึ้น และอยู่ใน `SPEC_NM_MIN..SPEC_NM_MAX`)
+- `/cal/reset` ล้างกลับไปใช้ 2-point fallback
+- `/spectrum/flip` / serial `i` จะ **mirror ตาราง cal** ตามลำดับ row และบันทึกทั้ง axis+cal พร้อมกัน
+- ลำดับ row ต้องเป็นน้ำเงิน→แดงก่อน calibrate ไม่งั้นจุดจะเรียง nm จากมากไปน้อยและถูก reject
+
 ---
 
 ## 7. Web UI / Endpoints
@@ -185,7 +196,7 @@ Axis detection (`spectrum_processing.h`):
 | Path | งาน |
 |---|---|
 | `/` | หน้าเว็บ (กราฟ + ภาพกล้อง + overlay + Axis trim + Dataset panel) |
-| `/data` | JSON: `peak`, `peakNm`, `max`, `scale`, `nmStart/End`, `axisA/B/On`, `invert`, `orientKnown`, `combine`, `col`, `colRange`, `modelReady`, `hasPred`, `pred`, `modelUnit`, `samples`, `fps`, `spectrum[160]` |
+| `/data` | JSON: `peak`, `peakNm`, `max`, `scale`, `nmStart/End`, `nmMin/Max`, `specLen`, `calCount`, `calActive`, `calPoints`, `axisA/B/On`, `invert`, `orientKnown`, `combine`, `col`, `colRange`, `modelReady`, `hasPred`, `pred`, `modelUnit`, `samples`, `fps`, `spectrum[160]` |
 | `/capture` | JPEG snapshot |
 | `/record?conc=<value>` | บันทึกแถว CSV (ปฏิเสธถ้าสเปกตรัมเก่า > 3 s) |
 | `/dataset.csv` | ดาวน์โหลด CSV |
@@ -199,6 +210,10 @@ Axis detection (`spectrum_processing.h`):
 | `/axis/save` | บันทึก NVS ทันที (flush ค่าที่ค้างอยู่) |
 | `/spectrum/flip` | สลับลำดับ row (blue↔red) + lock + NVS |
 | `/spectrum/orient` | auto-detect ปลายน้ำเงินจากเฟรมปัจจุบัน + lock + NVS |
+| `/cal` | `{"count","active","nmStart","nmEnd","points":[[px,nm],...]}` |
+| `/cal/peaks` | peak ที่ตรวจได้: `px`, `nm` (ตาม cal ปัจจุบัน), `val`, `prom` |
+| `/cal/set?points=<px>:<nm>,...` | บันทึก 2-8 จุด (ต้องเรียง px/nm ขึ้น และอยู่ใน 380-700) |
+| `/cal/reset` | ล้าง calibration กลับไปใช้ `CAL_*` |
 | `/ping` | `pong` (ทดสอบเร็ว) |
 
 อื่น ๆ: captive portal redirect ทุก path ที่ไม่รู้จัก, `[443]` probe log เมื่อ browser ใช้ HTTPS
@@ -218,6 +233,7 @@ Axis detection (`spectrum_processing.h`):
 | Serial `d` | dark frame |
 | Serial `p` | predict |
 | Serial `i` | flip ลำดับ row (blue↔red) + NVS |
+| Serial `w` | พิมพ์ calibration points + peak ที่ตรวจได้ |
 
 **ต้องแก้เมื่อรู้ GPIO**: `DARKFRAME_BUTTON_PIN`, `CAL_BUTTON_PIN`
 
@@ -268,6 +284,7 @@ Touch 0x3B: found
 Axis loaded from NVS: a=... b=... (locked)
 Spectrum order loaded from NVS: normal (blue at top)
 Spectrum combine: average, row order: normal
+Wavelength calibration loaded: 3 points, 380.0-700.0 nm
 Setup complete. Starting capture...
 Serial commands: c=axis calibrate (locks), d=dark frame, p=predict, a=auto align, i=flip spectrum order
 [hb] up=..s stations=.. heap=..
@@ -283,6 +300,7 @@ Serial commands: c=axis calibrate (locks), d=dark frame, p=predict, a=auto align
 | ค่า intensity ต่ำ | ตรวจ `a`,`b` ว่าตรงแนว, tune exposure |
 | ปลายน้ำเงินต่ำผิดปกติ/อยู่ผิดข้าง | `/data` (`invert`,`orientKnown`,`combine`), กด **Auto detect order** หรือ **Flip spectrum**; หลอดไฟต้องมีทั้งปลายแดงและน้ำเงิน |
 | สเปกตรัมกลับด้าน (แดงซ้าย) | `/spectrum/flip` หรือ serial `i`; ค่าเก็บใน NVS |
+| peak nm ไม่ตรงกับหลอด reference | หน้า **Wavelength calibration** → Find peaks → กรอก nm จริง → Apply; ตรวจ `/data` (`calCount`,`nmStart/End`); serial `w` พิมพ์ peak ทั้งหมด |
 
 เครื่องมือทดสอบ offline (ไม่ต้องมี ESP32): compile `spectrum_processing.h` ด้วย g++ + stub
 แล้วสร้างเฟรมสังเคราะห์เรียก `fitSpectrumAxis()` / `detectSpectrumOrientation()` — ใช้ตรวจ regression ของ algorithm ได้
@@ -294,7 +312,9 @@ Serial commands: c=axis calibrate (locks), d=dark frame, p=predict, a=auto align
 - **Touch**: แก้เป็น bus **8/7 + BSP** แล้ว (เดิม 21/22 ผิด) — ถ้ายังไม่ขึ้นให้ดู log `Touch 0x3B:` ตอนบูต และ fallback ไป BOOT
 - **ปุ่มจริงยังไม่ผูก**: BOOT อาจเสีย, ต้องตั้ง `DARKFRAME_BUTTON_PIN`/`CAL_BUTTON_PIN` ให้ตรง
 - **Stack**: ห้าม array ใหญ่ (~2 KB+) บน stack ของ loop task; ใช้ `static` (เคย crash canary)
-- ค่า calibration เป็น 380–700 แบบ uncalibrated; ต้องวัดหลอด fluorescent จริง
+- ค่า fallback ของ wavelength ยังเป็น 380–700 แบบ uncalibrated; ใช้หน้า **Wavelength calibration** วัดเส้นจริง (เช่น 405/546 nm) แล้วบันทึก — ไม่ต้อง reflash
+- Calibration points ต้องอยู่ใน `SPEC_NM_MIN..SPEC_NM_MAX` (380–700) และเรียง px/nm ขึ้น; ถ้าต้องใช้ UV (<380) ต้องขยาย macro ก่อน
+- เรียงลำดับ row (blue→red) ให้ถูกก่อน calibrate ไม่งั้นจุดจะถูก reject เพราะ nm เรียงกลับด้าน
 - Auto row order ต้องมีทั้งปลายแดง/น้ำเงิน; แหล่ง monochromatic จะคงค่าเดิม (`orientKnown=false`)
 - ช่อง B ของกล้องอาจตอบสนองต่ำกว่า G จริง; ถ้าปลายน้ำเงินยังอ่อนเทียบ white reference ให้วัดแล้วตั้ง `COMBINE_GAIN_B` (แล้วเทรนใหม่)
 - saturation ถูกตั้งเป็น 0 เพื่อไม่ให้ ISP ผสม R/G/B; อย่าลดติดลบอีก
@@ -353,3 +373,4 @@ Serial commands: c=axis calibrate (locks), d=dark frame, p=predict, a=auto align
 | `177c733` | vendor Waveshare AXS15231B touch driver ใน sketch folder |
 | `b6cdeeb` | calibrate แบบ manual เท่านั้น + NVS, fit half-max midpoint, เส้นเหลืองฝังใน /capture |
 | `0ab187e` | equal-weight combine, runtime row order (auto/flip/NVS), max-channel axis brightness, saturation 0 |
+| `1bd1f8c` | runtime N-point wavelength calibration (peak finder, web panel, NVS `cal`) |
