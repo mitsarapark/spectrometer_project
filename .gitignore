@@ -1,4 +1,4 @@
-# Session transcripts (never commit these)
+# Session transcripts
 session-*.md
 spectro.md
 
@@ -8,3 +8,7 @@ ml/*.pyc
 ml/*.png
 ml/dataset.csv
 ml/model_weights.h
+
+AGENTS.md
+problem.md
+PROJECT_STATUS.md
