@@ -18,7 +18,7 @@
 spectrometer/            sketch หลัก
   spectrometer.ino       setup/loop, camera, WiFi/WebServer, HTML, pipeline
   spectrum_processing.h  extraction, dark frame, averaging, combine, calibration
-  display.h              วาดกราฟ/แกน/ข้อมูล/ปุ่ม PREDICT ลง LCD
+  display.h              วาดกราฟ/แกน/ข้อมูล/ปุ่ม MENU+PREDICT และเมนู calibrate ลง LCD
   dataset.h              บันทึก CSV ลง LittleFS
   inference.h            รัน PLS dot product บนเครื่อง
   model_weights.h        โมเดล (placeholder จนกว่าจะเทรน)
@@ -35,6 +35,10 @@ test/                    โค้ดทดสอบ (reference เท่าน�
 - Auto/สลับลำดับ row ให้กราฟวิ่งน้ำเงิน (380 nm) → แดง (700 nm) ด้วย `/spectrum/flip`, `/spectrum/orient` หรือ serial `i`
 - Runtime wavelength calibration: หา peak อัตโนมัติจากหลอด reference แล้วกรอก nm ที่รู้ค่า (2–8 จุด)
   → piecewise-linear px→nm เก็บใน NVS; 2-point `CAL_*` เป็น fallback
+- **เมนู calibrate บนจอ** (ปุ่ม MENU ข้าง PREDICT) ใช้ได้แม้เปิดเว็บไม่ได้:
+  axis calibrate, dark frame, flip/auto row order, เลือกหลอด reference (แตะซ้ำเพื่อวน),
+  calibrate wavelength จาก preset (Fluorescent/Hydrogen/Neon/Cadmium), back
+  — BOOT สั้น = เลื่อนรายการ, BOOT ค้าง = รันรายการที่เลือก (serial `m` เปิดเมนูได้)
 - กราฟ + color bar + peak (nm)/max/FPS บน LCD
 - WiFi AP + หน้าเว็บแสดงกราฟและภาพกล้อง พร้อมเส้น/แถบเอียงตามแนวจริง
 - Axis calibration ผ่าน `/calibrate`, serial `c` หรือปุ่มที่สาม (ถ้าต่อ)
@@ -66,7 +70,10 @@ python train_plsr.py --csv dataset.csv --unit "%"
 
 - ค่าเริ่มต้น map ทั้งคอลัมน์เป็น **380–700 nm** (`CAL_*`); calibrate จริงได้จากหน้า **Wavelength calibration**
   (ปิดไฟห้อง เปิดหลอด reference → Find peaks → กรอก nm จริง → Apply) โดยไม่ต้อง reflash
+  หรือจาก **เมนูบนจอ** (MENU → Lamp preset → Calibrate wavelength) เมื่อเลือกหลอดจาก preset ไว้แล้ว
 - Calibration points ต้องอยู่ใน 380–700 nm และต้องเรียง px/nm ขึ้น; ต้องจัดลำดับ row (blue→red) ให้ถูกก่อน calibrate
+- Calibrate จาก preset บนจอต้องจับคู่เส้นหลอดได้ ≥3 เส้นและกระจาย ≥50 nm (เช่น fluorescent 405/436/546/577)
+  ถ้าไม่ผ่านจะขึ้นข้อความบนจอและ**คงค่าเดิม**; เมนูเลือกหลอดอื่นได้เฉพาะที่บรรจุไว้ในโค้ด
 - Calibration อย่างเดียว **ไม่ต้องเทรนโมเดลใหม่** (feature ยังเป็น pixel index เดิม, เปลี่ยนแค่หัวตาราง nm)
 - ค่าข้อมูลดิบไม่ถูก clamp; clamp เฉพาะตอนวาดบนจอ
 - เปลี่ยน exposure/gain/calibration/COMBINE_MODE/COMBINE_GAIN แล้วต้องเก็บ dataset ใหม่

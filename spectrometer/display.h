@@ -233,6 +233,119 @@ bool pointInPredictButton(uint16_t x, uint16_t y) {
            (y >= BTN_Y) && (y < BTN_Y + BTN_H);
 }
 
+// On-screen MENU button, left of PREDICT. Opens the calibration menu so
+// axis calibration / dark frame / row order / wavelength calibration can
+// be run without the web page (e.g. when WiFi or the browser fails).
+#define FUNC_X      10
+#define FUNC_Y      BTN_Y
+#define FUNC_W      140
+#define FUNC_H      BTN_H
+
+void drawFuncButton(bool pressed) {
+    gfx->fillRect(FUNC_X, FUNC_Y, FUNC_W, FUNC_H, pressed ? BLUE : DARKBLUE);
+    gfx->drawRect(FUNC_X, FUNC_Y, FUNC_W, FUNC_H, CYAN);
+    gfx->setTextSize(2);
+    gfx->setTextColor(WHITE);
+    gfx->setCursor(FUNC_X + 28, FUNC_Y + 9);
+    gfx->print("MENU");
+    gfx->setTextSize(1);
+}
+
+bool pointInFuncButton(uint16_t x, uint16_t y) {
+    return (x >= FUNC_X) && (x < FUNC_X + FUNC_W) &&
+           (y >= FUNC_Y) && (y < FUNC_Y + FUNC_H);
+}
+
+// ---------------- Calibration menu (LCD, touch) ----------------
+// Fixed full-screen list. Row 5 (index 4) is the reference-lamp selector:
+// tapping it cycles through the lamp presets compiled into the sketch.
+#define MENU_ROW_COUNT   7
+#define MENU_ROW_X       10
+#define MENU_ROW_W       (DISP_WIDTH - 20)
+#define MENU_ROW_H       42
+#define MENU_ROW_Y0      56
+#define MENU_ROW_STEP    50
+
+// lampName = selected reference lamp, status = last action result (may
+// be empty), selected = row highlighted for BOOT-button navigation
+// (-1 = none). Details below each label are read from pipeline state.
+void drawMenuScreen(const char *lampName, const char *status, int selected) {
+    gfx->fillScreen(BLACK);
+
+    gfx->setTextSize(2);
+    gfx->setTextColor(CYAN);
+    gfx->setCursor(MENU_ROW_X, 12);
+    gfx->print("CALIBRATION");
+    gfx->drawFastHLine(MENU_ROW_X, 34, DISP_WIDTH - 20, DARKGREY);
+
+    static const char *labels[MENU_ROW_COUNT] = {
+        "Axis calibrate", "Dark frame", "Flip row order",
+        "Auto row order", "Lamp preset", "Calibrate wavelength", "Back"
+    };
+
+    for (int i = 0; i < MENU_ROW_COUNT; i++) {
+        const int y = MENU_ROW_Y0 + i * MENU_ROW_STEP;
+        gfx->fillRect(MENU_ROW_X, y, MENU_ROW_W, MENU_ROW_H,
+                      (i == selected) ? BLUE : DARKBLUE);
+        gfx->drawRect(MENU_ROW_X, y, MENU_ROW_W, MENU_ROW_H, CYAN);
+
+        gfx->setTextSize(1);
+        gfx->setTextColor(WHITE);
+        gfx->setCursor(MENU_ROW_X + 8, y + 6);
+        if (i == 4) {
+            gfx->printf("Lamp: %s", lampName);
+        } else {
+            gfx->print(labels[i]);
+        }
+
+        gfx->setTextColor(YELLOW);
+        gfx->setCursor(MENU_ROW_X + 8, y + 22);
+        switch (i) {
+            case 0:
+                gfx->printf("a=%+.4f b=%.1f%s", specSlope, specIntercept,
+                            axisLocked ? " (locked)" : "");
+                break;
+            case 1:
+                gfx->print(darkFrameCaptured ? "ON" : "OFF - cover the slit");
+                break;
+            case 2:
+                gfx->printf("order: %s", spectrumInvert ? "flipped" : "normal");
+                break;
+            case 3:
+                gfx->print("detect blue end from frame");
+                break;
+            case 4:
+                gfx->print("tap to cycle reference lamp");
+                break;
+            case 5:
+                gfx->printf("%s, %d pts",
+                            wavelengthCalibrationActive() ? "custom" : "default",
+                            calPointCount);
+                break;
+            default:
+                gfx->print("return to the graph");
+                break;
+        }
+    }
+
+    if (status != nullptr && status[0] != '\0') {
+        gfx->setTextSize(1);
+        gfx->setTextColor(GREEN);
+        gfx->setCursor(MENU_ROW_X, MENU_ROW_Y0 + MENU_ROW_COUNT * MENU_ROW_STEP + 6);
+        gfx->print(status);
+    }
+}
+
+// Row index under (x, y), or -1 when the touch misses every row.
+int menuRowAt(uint16_t x, uint16_t y) {
+    if (x < MENU_ROW_X || x >= MENU_ROW_X + MENU_ROW_W) return -1;
+    for (int i = 0; i < MENU_ROW_COUNT; i++) {
+        const int ry = MENU_ROW_Y0 + i * MENU_ROW_STEP;
+        if (y >= ry && y < ry + MENU_ROW_H) return i;
+    }
+    return -1;
+}
+
 // Transient result box shown for a few seconds after a prediction.
 void drawPredictionPopup(float value, bool ok) {
     const int w = 250, h = 90;

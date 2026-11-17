@@ -1188,6 +1188,25 @@ static int detectOrientationWithFit(camera_fb_t *fb) {
 // /spectrum/flip toggles the extracted row order; /spectrum/orient runs
 // the red/blue centroid detector once. Both persist the result together
 // with the axis so the setting survives a reboot.
+
+// One-shot order detection, shared by the web endpoint and the on-screen
+// calibration menu. Returns 1 = updated, 0 = no red/blue info, -1 = camera
+// busy (a monochromatic source cannot decide the order and keeps it).
+static int autoDetectSpectrumOrder() {
+    camera_fb_t *fb = esp_camera_fb_get();
+    if (!fb) return -1;
+
+    const int vote = detectOrientationWithFit(fb);
+    esp_camera_fb_return(fb);
+
+    if (vote < 0) return 0;
+
+    setSpectrumInvert(vote != 0);
+    spectrumInvertKnown = true;
+    saveAxisCalibration();
+    return 1;
+}
+
 static void sendSpectrumOrderJson(bool ok, const char *err) {
     String out = "{\"ok\":";
     out += ok ? "true" : "false";
@@ -1220,22 +1239,15 @@ void handleSpectrumFlip() {
 }
 
 void handleSpectrumOrient() {
-    camera_fb_t *fb = esp_camera_fb_get();
-    if (!fb) {
+    const int r = autoDetectSpectrumOrder();
+    if (r < 0) {
         sendSpectrumOrderJson(false, "camera busy");
         return;
     }
-    int vote = detectOrientationWithFit(fb);
-    esp_camera_fb_return(fb);
-
-    if (vote < 0) {
+    if (r == 0) {
         sendSpectrumOrderJson(false, "no red/blue info");
         return;
     }
-
-    setSpectrumInvert(vote != 0);
-    spectrumInvertKnown = true;
-    saveAxisCalibration();
     Serial.printf("Spectrum order auto: %s\n",
                   spectrumInvert ? "flipped (red at top)" : "normal (blue at top)");
     sendSpectrumOrderJson(true, nullptr);
@@ -1653,10 +1665,11 @@ void setup() {
     drawAxes();
     drawColorBar();
     drawPredictButton(false);
+    drawFuncButton(false);
     gfx->flush();
 
     Serial.println("Setup complete. Starting capture...");
-    Serial.println("Serial commands: c=axis calibrate (locks), d=dark frame, p=predict, a=auto align, i=flip spectrum order, w=wavelength peaks");
+    Serial.println("Serial commands: c=axis calibrate (locks), d=dark frame, p=predict, a=auto align, i=flip spectrum order, m=calibration menu, w=wavelength peaks");
 }
 
 // ============================================================
@@ -1767,6 +1780,7 @@ bool runAxisCalibration() {
     drawAxes();
     drawColorBar();
     drawPredictButton(false);
+    drawFuncButton(false);
     gfx->flush();
     lastFrameTime = millis();
     return (m >= 5);
@@ -1795,12 +1809,276 @@ void runDarkFrame() {
     drawAxes();
     drawColorBar();
     drawPredictButton(false);
+    drawFuncButton(false);
     gfx->flush();
     lastFrameTime = millis();
 }
 
+// ============================================================
+// CALIBRATION MENU (on-screen, touch)
+// ============================================================
+// Fallback for when the web page cannot be opened: the MENU button shows
+// this list on the LCD and every action runs locally. Wavelength
+// calibration needs the known lines of a reference lamp, so it works from
+// compiled-in presets: tap "Lamp preset" to cycle, then "Calibrate
+// wavelength" to match the detected peaks to that lamp and save the table.
+
+struct LampPreset {
+    const char *name;
+    const float *lines;
+    int count;
+};
+
+// Hg lines of a fluorescent tube (the 577/579 pair usually merges into
+// one peak - the matcher tolerates that).
+static const float LAMP_FLUORESCENT_NM[] = {405.0f, 436.0f, 546.1f, 577.0f, 579.1f};
+// Hydrogen Balmer lines (discharge tube).
+static const float LAMP_HYDROGEN_NM[]    = {410.2f, 434.0f, 486.1f, 656.3f};
+// Neon sign / spectral tube.
+static const float LAMP_NEON_NM[]        = {585.2f, 588.2f, 594.5f, 614.3f, 640.2f, 650.7f, 667.8f};
+// Cadmium spectral tube.
+static const float LAMP_CADMIUM_NM[]     = {467.8f, 480.0f, 508.6f, 643.8f};
+
+static const LampPreset LAMP_PRESETS[] = {
+    {"Fluorescent", LAMP_FLUORESCENT_NM, 5},
+    {"Hydrogen",    LAMP_HYDROGEN_NM,    4},
+    {"Neon",        LAMP_NEON_NM,        7},
+    {"Cadmium",     LAMP_CADMIUM_NM,     4},
+};
+static const int LAMP_PRESET_COUNT = (int)(sizeof(LAMP_PRESETS) / sizeof(LAMP_PRESETS[0]));
+
+bool menuOpen = false;
+int lampPresetIndex = 0;
+int menuSel = -1;                 // BOOT-button highlight (-1 = none)
+char menuStatus[72] = "";
+
+// Match the preset lines to detected peaks without trusting the current
+// mapping: every (line pair, peak pair) hypothesis gives an affine
+// row<-nm map, and the one that explains the most lines wins (RANSAC
+// style). Dispersion is close enough to linear over one frame for this
+// to pick the right lines even when the placeholder map is far off.
+//
+// The tolerance is a few rows (not nm) so a "compressed" hypothesis that
+// squeezes the whole lamp into a small part of the sensor cannot match
+// unrelated peaks. A merged doublet (577/579 nm in a fluorescent tube)
+// may share one peak; it still counts as a single row.
+#define LAMP_TOL_ROWS   4.0f
+#define LAMP_MERGE_NM   3.5f
+#define LAMP_MAX_PEAKS  16
+#define LAMP_MIN_SPAN_NM 50.0f
+
+static int matchLampHypothesis(const SpectrumPeak *peaks, int np,
+                               const LampPreset &lamp, float scale, float offset,
+                               float *px, float *nm, float *errorOut) {
+    int owner[LAMP_MAX_PEAKS];
+    for (int i = 0; i < np && i < LAMP_MAX_PEAKS; i++) owner[i] = -1;
+
+    int n = 0;
+    float error = 0.0f;
+
+    for (int i = 0; i < lamp.count; i++) {
+        const float predict = scale * lamp.lines[i] + offset;
+        int best = -1;
+        float bestDist = LAMP_TOL_ROWS;
+        for (int m = 0; m < np && m < LAMP_MAX_PEAKS; m++) {
+            const float d = fabsf(peaks[m].pos - predict);
+            if (d >= bestDist) continue;
+            if (owner[m] >= 0 &&
+                fabsf(lamp.lines[i] - lamp.lines[owner[m]]) > LAMP_MERGE_NM) {
+                continue;
+            }
+            bestDist = d;
+            best = m;
+        }
+        if (best < 0) continue;
+
+        error += bestDist * bestDist;
+        if (owner[best] >= 0) continue;   // merged doublet: keep one row
+        owner[best] = i;
+        if (n < CAL_MAX_POINTS) {
+            px[n] = peaks[best].pos;
+            nm[n] = lamp.lines[i];
+            n++;
+        }
+    }
+
+    if (errorOut != nullptr) *errorOut = error;
+    return n;
+}
+
+// Returns the number of (row, nm) pairs written to px/nm (0 = no match).
+static int matchLampLines(const SpectrumPeak *peaks, int np,
+                          const LampPreset &lamp, float *px, float *nm) {
+    int bestRows = 0;
+    float bestError = 0.0f, bestScale = 0.0f, bestOffset = 0.0f;
+
+    for (int a = 0; a < lamp.count; a++) {
+        for (int b = a + 1; b < lamp.count; b++) {
+            const float dnm = lamp.lines[b] - lamp.lines[a];
+            if (dnm < 1.0f) continue;
+            for (int j = 0; j < np; j++) {
+                for (int k = j + 1; k < np; k++) {
+                    const float dpx = peaks[k].pos - peaks[j].pos;
+                    if (dpx < 1.0f) continue;
+
+                    const float scale = dpx / dnm;   // rows per nm
+                    const float offset = peaks[j].pos - scale * lamp.lines[a];
+
+                    float error = 0.0f;
+                    const int rows = matchLampHypothesis(peaks, np, lamp, scale,
+                                                         offset, px, nm, &error);
+
+                    if (rows > bestRows ||
+                        (rows == bestRows && error < bestError)) {
+                        bestRows = rows;
+                        bestError = error;
+                        bestScale = scale;
+                        bestOffset = offset;
+                    }
+                }
+            }
+        }
+    }
+
+    if (bestRows < 3 || bestScale <= 0.0f) return 0;
+
+    // Re-run the winning hypothesis so px/nm hold its rows.
+    return matchLampHypothesis(peaks, np, lamp, bestScale, bestOffset,
+                               px, nm, nullptr);
+}
+
+// Detect the selected lamp's lines and store them as the runtime
+// wavelength calibration. On failure the previous table is untouched.
+static bool applyLampCalibration(String &msg) {
+    const LampPreset &lamp = LAMP_PRESETS[lampPresetIndex];
+
+    if (lastSpectrumMs == 0 || millis() - lastSpectrumMs > 3000) {
+        msg = "No fresh spectrum - wait a frame";
+        return false;
+    }
+
+    SpectrumPeak peaks[12];
+    const int np = findSpectrumPeaks(spectrumCombined, SPECTRUM_LEN, peaks, 12);
+    if (np < 2) {
+        char buf[64];
+        snprintf(buf, sizeof(buf), "Only %d peak(s) - raise the light level", np);
+        msg = buf;
+        return false;
+    }
+
+    float px[CAL_MAX_POINTS], nm[CAL_MAX_POINTS];
+    const int n = matchLampLines(peaks, np, lamp, px, nm);
+    if (n < 3) {
+        char buf[64];
+        snprintf(buf, sizeof(buf), "%s: matched %d row(s), need 3", lamp.name, n);
+        msg = buf;
+        return false;
+    }
+
+    // Rows are stored in increasing nm order. A cluster of neighbouring
+    // lines (e.g. only the 640-668 nm neon group) gives a map that would
+    // extrapolate wildly across the sensor, so ask for a real spread.
+    if (nm[n - 1] - nm[0] < LAMP_MIN_SPAN_NM) {
+        char buf[64];
+        snprintf(buf, sizeof(buf), "%s: span %.0f nm, need %.0f nm", lamp.name,
+                 (double)(nm[n - 1] - nm[0]), (double)LAMP_MIN_SPAN_NM);
+        msg = buf;
+        return false;
+    }
+
+    if (!setWavelengthCalibration(px, nm, n)) {
+        msg = "Rejected - check the row order first";
+        return false;
+    }
+
+    saveWavelengthCalibration();
+    Serial.printf("Lamp cal (%s): %d/%d lines, %.1f-%.1f nm\n",
+                  lamp.name, n, lamp.count, pixelToNm(0.0f),
+                  pixelToNm((float)(SPECTRUM_LEN - 1)));
+    for (int i = 0; i < calPointCount; i++) {
+        Serial.printf("  px=%.2f -> %.1f nm\n", calPointPx[i], calPointNm[i]);
+    }
+
+    char buf[48];
+    snprintf(buf, sizeof(buf), "%d pts, %d-%d nm", n,
+             (int)pixelToNm(0.0f), (int)pixelToNm((float)(SPECTRUM_LEN - 1)));
+    msg = buf;
+    return true;
+}
+
+static void drawMenu() {
+    drawMenuScreen(LAMP_PRESETS[lampPresetIndex].name, menuStatus, menuSel);
+    gfx->flush();
+}
+
+static void openMenu() {
+    menuOpen = true;
+    menuSel = -1;
+    menuStatus[0] = '\0';
+    drawMenu();
+}
+
+static void closeMenu() {
+    menuOpen = false;
+    gfx->fillScreen(BLACK);
+    drawAxes();
+    drawColorBar();
+    drawPredictButton(false);
+    drawFuncButton(false);
+    gfx->flush();
+    lastFrameTime = millis();
+}
+
+static void runMenuAction(int row) {
+    switch (row) {
+        case 0: {
+            const bool ok = runAxisCalibration();
+            snprintf(menuStatus, sizeof(menuStatus), "Axis: %s a=%+.4f b=%.1f",
+                     ok ? "locked" : "failed", specSlope, specIntercept);
+            break;
+        }
+        case 1:
+            runDarkFrame();
+            snprintf(menuStatus, sizeof(menuStatus), "Dark frame captured");
+            break;
+        case 2:
+            setSpectrumInvert(!spectrumInvert);
+            spectrumInvertKnown = true;
+            saveAxisCalibration();
+            snprintf(menuStatus, sizeof(menuStatus), "Order: %s",
+                     spectrumInvert ? "flipped" : "normal");
+            break;
+        case 3: {
+            const int r = autoDetectSpectrumOrder();
+            snprintf(menuStatus, sizeof(menuStatus), "%s",
+                     r == 1 ? "Order detected from frame"
+                            : (r == 0 ? "No red/blue info - keep order"
+                                      : "Camera busy"));
+            break;
+        }
+        case 4:
+            lampPresetIndex = (lampPresetIndex + 1) % LAMP_PRESET_COUNT;
+            snprintf(menuStatus, sizeof(menuStatus), "Lamp: %s",
+                     LAMP_PRESETS[lampPresetIndex].name);
+            break;
+        case 5: {
+            String msg;
+            applyLampCalibration(msg);
+            snprintf(menuStatus, sizeof(menuStatus), "%s", msg.c_str());
+            break;
+        }
+        default:
+            closeMenu();
+            return;
+    }
+    drawMenu();
+}
+
 // BOOT button: short press = predict, long press (>= DARKFRAME_HOLD_MS)
 // = dark frame. Acting on release keeps both actions unambiguous.
+// While the calibration menu is open the same button navigates it, so the
+// menu is usable even if the touch panel stops responding:
+//   short = next item, long = run the highlighted item.
 void handleBootButton() {
     static bool wasPressed = false;
     static unsigned long pressStart = 0;
@@ -1812,7 +2090,20 @@ void handleBootButton() {
         pressStart = millis();
     } else if (!pressed && wasPressed) {
         wasPressed = false;
-        if (millis() - pressStart >= DARKFRAME_HOLD_MS) runDarkFrame();
+        const bool held = (millis() - pressStart >= DARKFRAME_HOLD_MS);
+
+        if (menuOpen) {
+            if (held) {
+                if (menuSel >= 0) runMenuAction(menuSel);
+                else closeMenu();
+            } else {
+                menuSel = (menuSel + 1) % MENU_ROW_COUNT;
+                drawMenu();
+            }
+            return;
+        }
+
+        if (held) runDarkFrame();
         else triggerPrediction();
     }
 }
@@ -1835,6 +2126,7 @@ void handleCalButton() {
 // from the Serial Monitor without any button.
 //   c = axis calibration (locks the line), d = dark frame, p = predict,
 //   a = auto align (fit + lock), i = flip spectrum row order,
+//   m = open/close the on-screen calibration menu (BOOT then navigates),
 //   w = wavelength calibration report (points + detected peaks)
 static void printCalibrationReport() {
     Serial.printf("Wavelength calibration: %s, %d points\n",
@@ -1873,6 +2165,9 @@ void handleSerialCommands() {
             saveAxisCalibration();
             Serial.printf("Spectrum order flipped: %s\n",
                           spectrumInvert ? "red at top" : "blue at top");
+        } else if (c == 'm' || c == 'M') {
+            if (menuOpen) closeMenu();
+            else openMenu();
         } else if (c == 'w' || c == 'W') {
             printCalibrationReport();
         }
@@ -1891,17 +2186,35 @@ void handleTouchButton() {
 
     uint16_t x = 0, y = 0;
     bool down = readTouch(x, y);
-    bool inside = down && pointInPredictButton(x, y);
 
-    if (inside && !wasDown) {
+    if (down && !wasDown) {
         wasDown = true;
-        drawPredictButton(true);
-        gfx->flush();
-        triggerPrediction();
-    } else if (!down && wasDown) {
+        if (menuOpen) {
+            const int row = menuRowAt(x, y);
+            if (row >= 0) {
+                runMenuAction(row);   // redraws the menu (or closes it)
+            }
+        } else if (pointInPredictButton(x, y)) {
+            drawPredictButton(true);
+            gfx->flush();
+            triggerPrediction();
+        } else if (pointInFuncButton(x, y)) {
+            drawFuncButton(true);
+            gfx->flush();
+            openMenu();
+        }
+        return;
+    }
+
+    if (!down && wasDown) {
         wasDown = false;
-        drawPredictButton(false);
-        gfx->flush();
+        if (menuOpen) {
+            drawMenu();
+        } else {
+            drawFuncButton(false);
+            drawPredictButton(false);
+            gfx->flush();
+        }
     }
 }
 
@@ -2021,22 +2334,29 @@ void loop() {
     webFPS = fps;
     lastSpectrumMs = millis();
 
-    // Update LCD
-    drawSpectrum(spectrumCombined);
-    drawColorBar();
+    // Update LCD. The calibration menu owns the screen while it is open,
+    // so the spectrum keeps being measured without overwriting the menu.
+    if (!menuOpen) {
+        drawSpectrum(spectrumCombined);
+        drawColorBar();
 
-    // Calculate FPS
-    frameCount++;
-    if (now - fpsTimer >= 1000) {
-        fps = frameCount * 1000.0f / (now - fpsTimer);
+        // Calculate FPS
+        frameCount++;
+        if (now - fpsTimer >= 1000) {
+            fps = frameCount * 1000.0f / (now - fpsTimer);
+            frameCount = 0;
+            fpsTimer = now;
+        }
+
+        drawInfo(spectrumCombined, maxVal, fps);
+        drawPredictButton(false);
+        drawFuncButton(false);
+        if (popupUntil != 0 && millis() < popupUntil) {
+            drawPredictionPopup(popupValue, popupOk);
+        }
+        gfx->flush();
+    } else {
         frameCount = 0;
         fpsTimer = now;
     }
-
-    drawInfo(spectrumCombined, maxVal, fps);
-    drawPredictButton(false);
-    if (popupUntil != 0 && millis() < popupUntil) {
-        drawPredictionPopup(popupValue, popupOk);
-    }
-    gfx->flush();
 }
